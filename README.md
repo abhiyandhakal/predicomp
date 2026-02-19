@@ -1,10 +1,11 @@
-# eBPF hello world: print PID on process creation
+# eBPF probes for process and memory research
 
-This example attaches an eBPF tracepoint program to:
+This repository currently contains two small eBPF programs:
 
-- `tracepoint/sched/sched_process_fork`
+- `proc_create`: prints `hello world <PID>` on process fork
+- `page_fault`: prints page fault events with PID, command name, and user/kernel type
 
-On each fork, it prints the child PID with `bpf_printk`.
+Both programs use `bpf_printk`, so output is read from `trace_pipe`.
 
 ## Requirements
 
@@ -12,13 +13,13 @@ On each fork, it prints the child PID with `bpf_printk`.
 - `clang`, `bpftool`, `libbpf`, `pkg-config`, `make`
 - root privileges to load/attach BPF
 
-## Build
+## Build all
 
 ```bash
 make
 ```
 
-## Run
+## Run process-fork monitor
 
 Terminal 1:
 
@@ -36,6 +37,27 @@ You should see lines like:
 
 ```text
 hello world 12345
+```
+
+## Run page-fault monitor
+
+Terminal 1:
+
+```bash
+sudo ./page_fault
+```
+
+Terminal 2:
+
+```bash
+sudo cat /sys/kernel/tracing/trace_pipe
+```
+
+You should see lines like:
+
+```text
+page_fault pid=12345 comm=bash type=user
+page_fault pid=12345 comm=bash type=kernel
 ```
 
 If `/sys/kernel/tracing/trace_pipe` does not exist, mount tracefs:

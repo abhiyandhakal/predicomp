@@ -1,4 +1,5 @@
 proc_create
+page_fault
 vmlinux.h
 src/*.o
 src/*.skel.h
