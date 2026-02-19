@@ -3,7 +3,7 @@
 This repository currently contains two small eBPF programs:
 
 - `proc_create`: prints `hello world <PID>` on process fork
-- `page_fault`: prints page fault events with PID, command name, and user/kernel type
+- `page_fault`: prints page fault events with PID, command name, user/kernel type, fault address, and instruction pointer
 
 Both programs use `bpf_printk`, so output is read from `trace_pipe`.
 
@@ -56,8 +56,8 @@ sudo cat /sys/kernel/tracing/trace_pipe
 You should see lines like:
 
 ```text
-page_fault pid=12345 comm=bash type=user
-page_fault pid=12345 comm=bash type=kernel
+page_fault pid=12345 comm=bash type=user addr=0x7f2ea77f4b90 ip=0x555f82b2f123
+page_fault pid=12345 comm=bash type=kernel addr=0xffff9a1f01234000 ip=0xffffffff81234567
 ```
 
 If `/sys/kernel/tracing/trace_pipe` does not exist, mount tracefs:

@@ -63,7 +63,10 @@ int main(void)
     }
 
     printf("attached. run: sudo cat %s\n", trace_pipe_path());
-    printf("expect lines: page_fault pid=<pid> comm=<comm> type=<user|kernel>\n");
+    printf(
+        "expect lines: page_fault pid=<pid> comm=<comm> type=<user|kernel> "
+        "addr=0x<addr> ip=0x<ip>\n"
+    );
     printf("press Ctrl+C to exit...\n");
 
     while (!stop) {
