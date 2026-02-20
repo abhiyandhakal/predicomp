@@ -80,3 +80,34 @@ Remove generated sample inputs too:
 ```bash
 make -C compressor-monitor clean-samples
 ```
+
+## Fairness Policy for RAM Compression
+
+For this research repo, the default fairness objective is a balanced score:
+
+- Goal: maximize useful memory savings per weighted CPU time
+- Workload assumption: high readback (decompression cost matters)
+- Minimum savings floor: skip compression if savings are below `5%`
+
+Define:
+
+- `bytes_saved = input_bytes - compressed_bytes`
+- `fair_score = bytes_saved / (compress_cpu_ms + readback_factor * decompress_cpu_ms)`
+
+Interpretation:
+
+- Higher `fair_score` is better.
+- `readback_factor` should be greater than 1 for read-heavy/hot memory so decompression time is penalized.
+- If a candidate does not meet the 5% savings floor, treat it as ineligible regardless of score.
+
+Practical default policy:
+
+- Use `LZ4 fast` as the baseline/default for hot memory paths.
+- Consider `zstd` settings only for colder pages where read probability is low and compression ratio is more important than decode latency.
+
+How to apply this to benchmark CSV output:
+
+1. For each row, compute `bytes_saved` from `size_bytes` and `compressed_bytes_median`.
+2. Use CPU-time metrics (`comp_thread_cpu_ms_median`, `decomp_thread_cpu_ms_median`) to compute `fair_score`.
+3. Drop rows with savings below 5%.
+4. Rank remaining rows by `fair_score` within each workload profile.

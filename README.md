@@ -9,6 +9,19 @@ This repository currently contains two small eBPF programs:
 `proc_create` and `page_fault` use `bpf_printk`, so output is read from `trace_pipe`.
 `swap_probe` prints periodic summaries to stdout.
 
+## Compression Fairness Policy
+
+For RAM compression experiments, use this default decision policy:
+
+- Baseline codec: `LZ4 fast`
+- Compress only if estimated savings are at least `5%`
+- Rank candidate settings by:
+  `fair_score = bytes_saved / (compress_cpu_ms + readback_factor * decompress_cpu_ms)`
+- For high-readback memory, use a larger `readback_factor` so decode cost is weighted more heavily
+- Prefer `zstd` only for colder pages where read probability is low and ratio dominates
+
+Detailed formula and benchmark application guidance live in `compressor-monitor/README.md`.
+
 ## Requirements
 
 - Linux kernel with BTF support (`/sys/kernel/btf/vmlinux` exists)
