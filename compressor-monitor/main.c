@@ -1,4 +1,7 @@
+#define _GNU_SOURCE
+
 #include <errno.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,59 +11,188 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <lz4.h>
+
 #define RESULTS_CSV "compressor-monitor/results.csv"
 #define SAMPLES_DIR "compressor-monitor/samples"
-#define RUNS_PER_CASE 5
+#define DEFAULT_RUNS 5
+#define DEFAULT_WARMUPS 2
+#define DEFAULT_MAX_SIZE (16U * 1024U * 1024U)
+#define MIN_SIZE 1024U
+#define MIX_BLOCK_SIZE 4096U
 
-struct sched_snapshot {
-    double vruntime;
-    double sum_exec_runtime;
-    unsigned long long nr_switches;
-    unsigned long long nr_voluntary_switches;
-    unsigned long long nr_involuntary_switches;
+enum dataset_kind {
+    DATASET_REPETITIVE = 0,
+    DATASET_UNIQUE = 1,
+    DATASET_MIXED_50_50 = 2,
 };
 
-struct sched_delta {
-    double vruntime;
-    double sum_exec_runtime;
-    long long nr_switches;
-    long long nr_voluntary_switches;
-    long long nr_involuntary_switches;
+struct options {
+    int runs;
+    int warmups;
+    size_t max_size;
+    int use_cpu_pin;
+    long cpu_id;
+};
+
+struct phase_metrics {
+    double wall_ms;
+    double thread_cpu_ms;
+    double process_cpu_ms;
 };
 
 struct run_metrics {
-    double compression_ms;
-    double decompression_ms;
-    unsigned long long input_bytes;
+    struct phase_metrics compress;
+    struct phase_metrics decompress;
     unsigned long long compressed_bytes;
     double ratio;
-    struct sched_delta compress_sched;
-    struct sched_delta decompress_sched;
     int validation_pass;
 };
 
 struct case_summary {
     const char *dataset_type;
     size_t size_bytes;
-    double compression_ms_median;
-    double decompression_ms_median;
     unsigned long long compressed_bytes_median;
     double ratio_median;
-    struct sched_delta compress_sched_median;
-    struct sched_delta decompress_sched_median;
+    double comp_wall_ms_median;
+    double decomp_wall_ms_median;
+    double comp_thread_cpu_ms_median;
+    double decomp_thread_cpu_ms_median;
+    double comp_proc_cpu_ms_median;
+    double decomp_proc_cpu_ms_median;
+    double comp_mib_per_s_median;
+    double decomp_mib_per_s_median;
     int all_validation_pass;
 };
 
-static int check_lz4_available(void)
-{
-    int rc;
+struct clock_snapshot {
+    struct timespec wall;
+    struct timespec thread_cpu;
+    struct timespec process_cpu;
+};
 
-    rc = system("command -v lz4 >/dev/null 2>&1");
-    if (rc != 0) {
+struct repetitive_state {
+    size_t offset;
+};
+
+struct unique_state {
+    uint64_t state;
+    unsigned int byte_index;
+};
+
+static void print_usage(const char *prog)
+{
+    printf("Usage: %s [--cpu <id>] [--runs <n>] [--warmups <n>] [--max-size <bytes>]\n", prog);
+}
+
+static int parse_positive_int(const char *value, int *out)
+{
+    char *end = NULL;
+    long parsed;
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed <= 0 || parsed > 1000000L) {
+        return -1;
+    }
+
+    *out = (int)parsed;
+    return 0;
+}
+
+static int parse_non_negative_int(const char *value, int *out)
+{
+    char *end = NULL;
+    long parsed;
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > 1000000L) {
+        return -1;
+    }
+
+    *out = (int)parsed;
+    return 0;
+}
+
+static int parse_positive_size(const char *value, size_t *out)
+{
+    char *end = NULL;
+    unsigned long long parsed;
+
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0ULL) {
+        return -1;
+    }
+
+    *out = (size_t)parsed;
+    return 0;
+}
+
+static int parse_options(int argc, char **argv, struct options *opts)
+{
+    int i;
+
+    opts->runs = DEFAULT_RUNS;
+    opts->warmups = DEFAULT_WARMUPS;
+    opts->max_size = DEFAULT_MAX_SIZE;
+    opts->use_cpu_pin = 0;
+    opts->cpu_id = -1;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--cpu") == 0) {
+            int parsed_cpu = 0;
+
+            if (i + 1 >= argc || parse_non_negative_int(argv[i + 1], &parsed_cpu) != 0) {
+                return -1;
+            }
+            opts->cpu_id = parsed_cpu;
+            opts->use_cpu_pin = 1;
+            i++;
+        } else if (strcmp(argv[i], "--runs") == 0) {
+            if (i + 1 >= argc || parse_positive_int(argv[i + 1], &opts->runs) != 0) {
+                return -1;
+            }
+            i++;
+        } else if (strcmp(argv[i], "--warmups") == 0) {
+            if (i + 1 >= argc || parse_non_negative_int(argv[i + 1], &opts->warmups) != 0) {
+                return -1;
+            }
+            i++;
+        } else if (strcmp(argv[i], "--max-size") == 0) {
+            if (i + 1 >= argc || parse_positive_size(argv[i + 1], &opts->max_size) != 0) {
+                return -1;
+            }
+            i++;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        } else {
+            return -1;
+        }
+    }
+
+    if (opts->max_size < MIN_SIZE) {
         return -1;
     }
 
     return 0;
+}
+
+static int pin_to_cpu(long cpu_id)
+{
+    cpu_set_t set;
+
+    if (cpu_id < 0 || cpu_id >= CPU_SETSIZE) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    CPU_ZERO(&set);
+    CPU_SET((int)cpu_id, &set);
+
+    return sched_setaffinity(0, sizeof(set), &set);
 }
 
 static int ensure_dir_exists(const char *path)
@@ -88,151 +220,6 @@ static int file_size_bytes(const char *path, unsigned long long *size_out)
     return 0;
 }
 
-static int compare_files(const char *path_a, const char *path_b)
-{
-    FILE *fa;
-    FILE *fb;
-    unsigned char buf_a[4096];
-    unsigned char buf_b[4096];
-    size_t na;
-    size_t nb;
-
-    fa = fopen(path_a, "rb");
-    if (!fa) {
-        return -1;
-    }
-
-    fb = fopen(path_b, "rb");
-    if (!fb) {
-        fclose(fa);
-        return -1;
-    }
-
-    while (1) {
-        na = fread(buf_a, 1, sizeof(buf_a), fa);
-        nb = fread(buf_b, 1, sizeof(buf_b), fb);
-
-        if (na != nb) {
-            fclose(fa);
-            fclose(fb);
-            return 0;
-        }
-
-        if (na == 0) {
-            break;
-        }
-
-        if (memcmp(buf_a, buf_b, na) != 0) {
-            fclose(fa);
-            fclose(fb);
-            return 0;
-        }
-    }
-
-    fclose(fa);
-    fclose(fb);
-    return 1;
-}
-
-static int parse_sched_snapshot(struct sched_snapshot *out)
-{
-    FILE *fp;
-    char line[512];
-    int got_vruntime = 0;
-    int got_sum_exec_runtime = 0;
-    int got_nr_switches = 0;
-    int got_nr_voluntary = 0;
-    int got_nr_involuntary = 0;
-
-    memset(out, 0, sizeof(*out));
-
-    fp = fopen("/proc/self/sched", "r");
-    if (!fp) {
-        return -1;
-    }
-
-    while (fgets(line, sizeof(line), fp)) {
-        if (sscanf(line, "se.vruntime%*[^:]: %lf", &out->vruntime) == 1) {
-            got_vruntime = 1;
-        } else if (sscanf(line, "se.sum_exec_runtime%*[^:]: %lf", &out->sum_exec_runtime) == 1) {
-            got_sum_exec_runtime = 1;
-        } else if (sscanf(line, "nr_switches%*[^:]: %llu", &out->nr_switches) == 1) {
-            got_nr_switches = 1;
-        } else if (sscanf(
-            line,
-            "nr_voluntary_switches%*[^:]: %llu",
-            &out->nr_voluntary_switches
-        ) == 1) {
-            got_nr_voluntary = 1;
-        } else if (sscanf(
-            line,
-            "nr_involuntary_switches%*[^:]: %llu",
-            &out->nr_involuntary_switches
-        ) == 1) {
-            got_nr_involuntary = 1;
-        }
-    }
-
-    fclose(fp);
-
-    if (!got_vruntime ||
-        !got_sum_exec_runtime ||
-        !got_nr_switches ||
-        !got_nr_voluntary ||
-        !got_nr_involuntary) {
-        return -1;
-    }
-
-    return 0;
-}
-
-static struct sched_delta compute_delta(
-    const struct sched_snapshot *before,
-    const struct sched_snapshot *after
-)
-{
-    struct sched_delta d;
-
-    d.vruntime = after->vruntime - before->vruntime;
-    d.sum_exec_runtime = after->sum_exec_runtime - before->sum_exec_runtime;
-    d.nr_switches = (long long)after->nr_switches - (long long)before->nr_switches;
-    d.nr_voluntary_switches =
-        (long long)after->nr_voluntary_switches - (long long)before->nr_voluntary_switches;
-    d.nr_involuntary_switches =
-        (long long)after->nr_involuntary_switches - (long long)before->nr_involuntary_switches;
-
-    return d;
-}
-
-static int run_timed_command(const char *cmd, double *elapsed_ms)
-{
-    struct timespec start;
-    struct timespec end;
-    long sec_diff;
-    long nsec_diff;
-    int rc;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
-        return -1;
-    }
-
-    rc = system(cmd);
-
-    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
-        return -1;
-    }
-
-    sec_diff = end.tv_sec - start.tv_sec;
-    nsec_diff = end.tv_nsec - start.tv_nsec;
-    *elapsed_ms = ((double)sec_diff * 1000.0) + ((double)nsec_diff / 1000000.0);
-
-    if (rc != 0) {
-        return rc;
-    }
-
-    return 0;
-}
-
 static uint64_t xorshift64star(uint64_t *state)
 {
     uint64_t x;
@@ -245,75 +232,160 @@ static uint64_t xorshift64star(uint64_t *state)
     return x * 2685821657736338717ULL;
 }
 
-static int write_repetitive_sample(FILE *fp, size_t size_bytes)
+static void repetitive_state_init(struct repetitive_state *st)
+{
+    st->offset = 0;
+}
+
+static int write_repetitive_bytes(FILE *fp, size_t bytes, struct repetitive_state *st)
 {
     static const char pattern[] = "PREDICOMP_REPETITIVE_PATTERN_0123456789abcdefghijklmnopqrstuvwxyz\n";
-    size_t pattern_len = sizeof(pattern) - 1;
-    size_t written = 0;
+    const size_t pattern_len = sizeof(pattern) - 1;
+    size_t remaining = bytes;
 
-    while (written < size_bytes) {
-        size_t chunk = pattern_len;
+    while (remaining > 0) {
+        size_t to_end = pattern_len - st->offset;
+        size_t chunk = remaining < to_end ? remaining : to_end;
 
-        if (chunk > (size_bytes - written)) {
-            chunk = size_bytes - written;
-        }
-
-        if (fwrite(pattern, 1, chunk, fp) != chunk) {
+        if (fwrite(pattern + st->offset, 1, chunk, fp) != chunk) {
             return -1;
         }
 
-        written += chunk;
+        remaining -= chunk;
+        st->offset = (st->offset + chunk) % pattern_len;
     }
 
     return 0;
 }
 
-static int write_unique_sample(FILE *fp, size_t size_bytes)
+static void unique_state_init(struct unique_state *st)
+{
+    st->state = 0x12345678ABCDEF00ULL;
+    st->byte_index = 0;
+}
+
+static unsigned char next_unique_byte(struct unique_state *st)
+{
+    unsigned char out;
+
+    if (st->byte_index == 0U) {
+        st->state = xorshift64star(&st->state);
+    }
+
+    out = (unsigned char)((st->state >> (st->byte_index * 8U)) & 0xFFU);
+    st->byte_index = (st->byte_index + 1U) & 7U;
+    return out;
+}
+
+static int write_unique_bytes(FILE *fp, size_t bytes, struct unique_state *st)
 {
     unsigned char buffer[4096];
-    size_t written = 0;
-    uint64_t state = 0x12345678ABCDEF00ULL;
+    size_t remaining = bytes;
 
-    while (written < size_bytes) {
+    while (remaining > 0) {
         size_t i;
-        size_t chunk = sizeof(buffer);
-
-        if (chunk > (size_bytes - written)) {
-            chunk = size_bytes - written;
-        }
+        size_t chunk = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
 
         for (i = 0; i < chunk; i++) {
-            if ((i % 8) == 0) {
-                state = xorshift64star(&state);
-            }
-            buffer[i] = (unsigned char)((state >> ((i % 8) * 8)) & 0xFF);
+            buffer[i] = next_unique_byte(st);
         }
 
         if (fwrite(buffer, 1, chunk, fp) != chunk) {
             return -1;
         }
 
-        written += chunk;
+        remaining -= chunk;
     }
 
     return 0;
 }
 
-static int generate_sample_if_needed(const char *dataset_type, size_t size_bytes, char *path, size_t path_len)
+static const char *dataset_name(enum dataset_kind kind)
+{
+    if (kind == DATASET_REPETITIVE) {
+        return "repetitive";
+    }
+    if (kind == DATASET_UNIQUE) {
+        return "unique";
+    }
+    return "mixed_50_50";
+}
+
+static int generate_sample_by_kind(FILE *fp, enum dataset_kind kind, size_t size_bytes)
+{
+    struct repetitive_state rep;
+    struct unique_state uni;
+
+    repetitive_state_init(&rep);
+    unique_state_init(&uni);
+
+    if (kind == DATASET_REPETITIVE) {
+        return write_repetitive_bytes(fp, size_bytes, &rep);
+    }
+
+    if (kind == DATASET_UNIQUE) {
+        return write_unique_bytes(fp, size_bytes, &uni);
+    }
+
+    {
+        size_t rep_remaining = size_bytes / 2;
+        size_t uni_remaining = size_bytes - rep_remaining;
+        int turn_rep = 1;
+
+        while (rep_remaining > 0 || uni_remaining > 0) {
+            size_t chunk;
+
+            if (turn_rep && rep_remaining > 0) {
+                chunk = rep_remaining < MIX_BLOCK_SIZE ? rep_remaining : MIX_BLOCK_SIZE;
+                if (write_repetitive_bytes(fp, chunk, &rep) != 0) {
+                    return -1;
+                }
+                rep_remaining -= chunk;
+            } else if (!turn_rep && uni_remaining > 0) {
+                chunk = uni_remaining < MIX_BLOCK_SIZE ? uni_remaining : MIX_BLOCK_SIZE;
+                if (write_unique_bytes(fp, chunk, &uni) != 0) {
+                    return -1;
+                }
+                uni_remaining -= chunk;
+            } else if (rep_remaining > 0) {
+                chunk = rep_remaining < MIX_BLOCK_SIZE ? rep_remaining : MIX_BLOCK_SIZE;
+                if (write_repetitive_bytes(fp, chunk, &rep) != 0) {
+                    return -1;
+                }
+                rep_remaining -= chunk;
+            } else {
+                chunk = uni_remaining < MIX_BLOCK_SIZE ? uni_remaining : MIX_BLOCK_SIZE;
+                if (write_unique_bytes(fp, chunk, &uni) != 0) {
+                    return -1;
+                }
+                uni_remaining -= chunk;
+            }
+
+            turn_rep = !turn_rep;
+        }
+    }
+
+    return 0;
+}
+
+static int generate_sample_if_needed(
+    enum dataset_kind kind,
+    size_t size_bytes,
+    char *path,
+    size_t path_len
+)
 {
     FILE *fp;
-    unsigned long long existing_size = 0;
     int rc;
+    unsigned long long existing_size = 0;
 
-    rc = snprintf(path, path_len, "%s/%s_%zu.bin", SAMPLES_DIR, dataset_type, size_bytes);
+    rc = snprintf(path, path_len, "%s/%s_%zu.bin", SAMPLES_DIR, dataset_name(kind), size_bytes);
     if (rc < 0 || (size_t)rc >= path_len) {
         return -1;
     }
 
-    if (file_size_bytes(path, &existing_size) == 0) {
-        if (existing_size == (unsigned long long)size_bytes) {
-            return 0;
-        }
+    if (file_size_bytes(path, &existing_size) == 0 && existing_size == (unsigned long long)size_bytes) {
+        return 0;
     }
 
     fp = fopen(path, "wb");
@@ -321,18 +393,26 @@ static int generate_sample_if_needed(const char *dataset_type, size_t size_bytes
         return -1;
     }
 
-    if (strcmp(dataset_type, "repetitive") == 0) {
-        rc = write_repetitive_sample(fp, size_bytes);
-    } else if (strcmp(dataset_type, "unique") == 0) {
-        rc = write_unique_sample(fp, size_bytes);
-    } else {
-        fclose(fp);
+    rc = generate_sample_by_kind(fp, kind, size_bytes);
+    fclose(fp);
+
+    return rc;
+}
+
+static int read_file_into_buffer(const char *path, unsigned char *buf, size_t size_bytes)
+{
+    FILE *fp;
+    size_t read_len;
+
+    fp = fopen(path, "rb");
+    if (!fp) {
         return -1;
     }
 
+    read_len = fread(buf, 1, size_bytes, fp);
     fclose(fp);
 
-    if (rc != 0) {
+    if (read_len != size_bytes) {
         return -1;
     }
 
@@ -367,347 +447,408 @@ static int cmp_ull(const void *a, const void *b)
     return 0;
 }
 
-static int cmp_ll(const void *a, const void *b)
+static int median_double(const double *values, size_t n, double *out)
 {
-    long long la = *(const long long *)a;
-    long long lb = *(const long long *)b;
+    double *tmp;
 
-    if (la < lb) {
+    tmp = malloc(n * sizeof(*tmp));
+    if (!tmp) {
         return -1;
     }
-    if (la > lb) {
-        return 1;
+
+    memcpy(tmp, values, n * sizeof(*tmp));
+    qsort(tmp, n, sizeof(*tmp), cmp_double);
+    *out = tmp[n / 2];
+    free(tmp);
+    return 0;
+}
+
+static int median_ull(const unsigned long long *values, size_t n, unsigned long long *out)
+{
+    unsigned long long *tmp;
+
+    tmp = malloc(n * sizeof(*tmp));
+    if (!tmp) {
+        return -1;
+    }
+
+    memcpy(tmp, values, n * sizeof(*tmp));
+    qsort(tmp, n, sizeof(*tmp), cmp_ull);
+    *out = tmp[n / 2];
+    free(tmp);
+    return 0;
+}
+
+static int capture_clocks(struct clock_snapshot *snap)
+{
+    if (clock_gettime(CLOCK_MONOTONIC, &snap->wall) != 0) {
+        return -1;
+    }
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &snap->thread_cpu) != 0) {
+        return -1;
+    }
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &snap->process_cpu) != 0) {
+        return -1;
     }
     return 0;
 }
 
-static double median_double(const double *values, size_t n)
+static double diff_ms(const struct timespec *start, const struct timespec *end)
 {
-    double tmp[RUNS_PER_CASE];
+    time_t sec = end->tv_sec - start->tv_sec;
+    long nsec = end->tv_nsec - start->tv_nsec;
 
-    memcpy(tmp, values, n * sizeof(double));
-    qsort(tmp, n, sizeof(double), cmp_double);
-    return tmp[n / 2];
+    return ((double)sec * 1000.0) + ((double)nsec / 1000000.0);
 }
 
-static unsigned long long median_ull(const unsigned long long *values, size_t n)
+static int measure_lz4_compress(
+    const unsigned char *input,
+    int input_size,
+    unsigned char *compressed,
+    int compressed_capacity,
+    int *compressed_size,
+    struct phase_metrics *metrics
+)
 {
-    unsigned long long tmp[RUNS_PER_CASE];
+    struct clock_snapshot start;
+    struct clock_snapshot end;
+    int out_size;
 
-    memcpy(tmp, values, n * sizeof(unsigned long long));
-    qsort(tmp, n, sizeof(unsigned long long), cmp_ull);
-    return tmp[n / 2];
-}
-
-static long long median_ll(const long long *values, size_t n)
-{
-    long long tmp[RUNS_PER_CASE];
-
-    memcpy(tmp, values, n * sizeof(long long));
-    qsort(tmp, n, sizeof(long long), cmp_ll);
-    return tmp[n / 2];
-}
-
-static struct sched_delta median_sched_delta(const struct sched_delta *deltas, size_t n)
-{
-    struct sched_delta out;
-    double vruntime_vals[RUNS_PER_CASE];
-    double sum_exec_vals[RUNS_PER_CASE];
-    long long switches_vals[RUNS_PER_CASE];
-    long long voluntary_vals[RUNS_PER_CASE];
-    long long involuntary_vals[RUNS_PER_CASE];
-    size_t i;
-
-    for (i = 0; i < n; i++) {
-        vruntime_vals[i] = deltas[i].vruntime;
-        sum_exec_vals[i] = deltas[i].sum_exec_runtime;
-        switches_vals[i] = deltas[i].nr_switches;
-        voluntary_vals[i] = deltas[i].nr_voluntary_switches;
-        involuntary_vals[i] = deltas[i].nr_involuntary_switches;
+    if (capture_clocks(&start) != 0) {
+        return -1;
     }
 
-    out.vruntime = median_double(vruntime_vals, n);
-    out.sum_exec_runtime = median_double(sum_exec_vals, n);
-    out.nr_switches = median_ll(switches_vals, n);
-    out.nr_voluntary_switches = median_ll(voluntary_vals, n);
-    out.nr_involuntary_switches = median_ll(involuntary_vals, n);
+    out_size = LZ4_compress_default(
+        (const char *)input,
+        (char *)compressed,
+        input_size,
+        compressed_capacity
+    );
 
-    return out;
+    if (capture_clocks(&end) != 0) {
+        return -1;
+    }
+
+    if (out_size <= 0) {
+        return -1;
+    }
+
+    metrics->wall_ms = diff_ms(&start.wall, &end.wall);
+    metrics->thread_cpu_ms = diff_ms(&start.thread_cpu, &end.thread_cpu);
+    metrics->process_cpu_ms = diff_ms(&start.process_cpu, &end.process_cpu);
+    *compressed_size = out_size;
+
+    return 0;
 }
 
-static int benchmark_one_run(
-    const char *input_path,
-    const char *compressed_path,
-    const char *decompressed_path,
+static int measure_lz4_decompress(
+    const unsigned char *compressed,
+    int compressed_size,
+    unsigned char *decompressed,
+    int expected_decompressed_size,
+    struct phase_metrics *metrics
+)
+{
+    struct clock_snapshot start;
+    struct clock_snapshot end;
+    int out_size;
+
+    if (capture_clocks(&start) != 0) {
+        return -1;
+    }
+
+    out_size = LZ4_decompress_safe(
+        (const char *)compressed,
+        (char *)decompressed,
+        compressed_size,
+        expected_decompressed_size
+    );
+
+    if (capture_clocks(&end) != 0) {
+        return -1;
+    }
+
+    if (out_size != expected_decompressed_size) {
+        return -1;
+    }
+
+    metrics->wall_ms = diff_ms(&start.wall, &end.wall);
+    metrics->thread_cpu_ms = diff_ms(&start.thread_cpu, &end.thread_cpu);
+    metrics->process_cpu_ms = diff_ms(&start.process_cpu, &end.process_cpu);
+
+    return 0;
+}
+
+static int run_one_iteration(
+    const unsigned char *input,
+    size_t input_size,
+    unsigned char *compressed,
+    size_t compressed_capacity,
+    unsigned char *decompressed,
     struct run_metrics *out
 )
 {
-    struct sched_snapshot compress_before;
-    struct sched_snapshot compress_after;
-    struct sched_snapshot decompress_before;
-    struct sched_snapshot decompress_after;
-    unsigned long long decompressed_size;
-    int cmp;
-    int rc;
-    char cmd[1024];
+    int compressed_size;
 
     memset(out, 0, sizeof(*out));
 
-    if (file_size_bytes(input_path, &out->input_bytes) != 0) {
+    if (measure_lz4_compress(
+        input,
+        (int)input_size,
+        compressed,
+        (int)compressed_capacity,
+        &compressed_size,
+        &out->compress
+    ) != 0) {
         return -1;
     }
 
-    if (parse_sched_snapshot(&compress_before) != 0) {
+    if (measure_lz4_decompress(
+        compressed,
+        compressed_size,
+        decompressed,
+        (int)input_size,
+        &out->decompress
+    ) != 0) {
         return -1;
     }
 
-    rc = snprintf(
-        cmd,
-        sizeof(cmd),
-        "lz4 -q -f '%s' '%s' >/dev/null 2>&1",
-        input_path,
-        compressed_path
-    );
-    if (rc < 0 || (size_t)rc >= sizeof(cmd)) {
-        return -1;
-    }
+    out->compressed_bytes = (unsigned long long)compressed_size;
+    out->ratio = (double)compressed_size / (double)input_size;
+    out->validation_pass = (memcmp(input, decompressed, input_size) == 0);
 
-    rc = run_timed_command(cmd, &out->compression_ms);
-    if (rc != 0) {
-        return -1;
-    }
-
-    if (parse_sched_snapshot(&compress_after) != 0) {
-        return -1;
-    }
-
-    if (parse_sched_snapshot(&decompress_before) != 0) {
-        return -1;
-    }
-
-    rc = snprintf(
-        cmd,
-        sizeof(cmd),
-        "lz4 -q -d -f '%s' '%s' >/dev/null 2>&1",
-        compressed_path,
-        decompressed_path
-    );
-    if (rc < 0 || (size_t)rc >= sizeof(cmd)) {
-        return -1;
-    }
-
-    rc = run_timed_command(cmd, &out->decompression_ms);
-    if (rc != 0) {
-        return -1;
-    }
-
-    if (parse_sched_snapshot(&decompress_after) != 0) {
-        return -1;
-    }
-
-    if (file_size_bytes(compressed_path, &out->compressed_bytes) != 0) {
-        return -1;
-    }
-
-    if (file_size_bytes(decompressed_path, &decompressed_size) != 0) {
-        return -1;
-    }
-
-    if (decompressed_size != out->input_bytes) {
-        out->validation_pass = 0;
-    }
-
-    cmp = compare_files(input_path, decompressed_path);
-    if (cmp < 0) {
-        return -1;
-    }
-    out->validation_pass = (cmp == 1);
-
-    out->ratio = (double)out->compressed_bytes / (double)out->input_bytes;
-    out->compress_sched = compute_delta(&compress_before, &compress_after);
-    out->decompress_sched = compute_delta(&decompress_before, &decompress_after);
-
-    return 0;
+    return out->validation_pass ? 0 : -1;
 }
 
 static int summarize_case(
     const char *dataset_type,
     size_t size_bytes,
     const struct run_metrics *runs,
+    int run_count,
     struct case_summary *summary
 )
 {
-    double compression_ms_vals[RUNS_PER_CASE];
-    double decompression_ms_vals[RUNS_PER_CASE];
-    unsigned long long compressed_bytes_vals[RUNS_PER_CASE];
-    double ratio_vals[RUNS_PER_CASE];
-    struct sched_delta compress_deltas[RUNS_PER_CASE];
-    struct sched_delta decompress_deltas[RUNS_PER_CASE];
-    size_t i;
+    double *comp_wall = NULL;
+    double *decomp_wall = NULL;
+    double *comp_thread_cpu = NULL;
+    double *decomp_thread_cpu = NULL;
+    double *comp_proc_cpu = NULL;
+    double *decomp_proc_cpu = NULL;
+    double *ratio = NULL;
+    unsigned long long *compressed_bytes = NULL;
+    int i;
+
+    comp_wall = calloc((size_t)run_count, sizeof(*comp_wall));
+    decomp_wall = calloc((size_t)run_count, sizeof(*decomp_wall));
+    comp_thread_cpu = calloc((size_t)run_count, sizeof(*comp_thread_cpu));
+    decomp_thread_cpu = calloc((size_t)run_count, sizeof(*decomp_thread_cpu));
+    comp_proc_cpu = calloc((size_t)run_count, sizeof(*comp_proc_cpu));
+    decomp_proc_cpu = calloc((size_t)run_count, sizeof(*decomp_proc_cpu));
+    ratio = calloc((size_t)run_count, sizeof(*ratio));
+    compressed_bytes = calloc((size_t)run_count, sizeof(*compressed_bytes));
+
+    if (!comp_wall || !decomp_wall || !comp_thread_cpu || !decomp_thread_cpu ||
+        !comp_proc_cpu || !decomp_proc_cpu || !ratio || !compressed_bytes) {
+        free(comp_wall);
+        free(decomp_wall);
+        free(comp_thread_cpu);
+        free(decomp_thread_cpu);
+        free(comp_proc_cpu);
+        free(decomp_proc_cpu);
+        free(ratio);
+        free(compressed_bytes);
+        return -1;
+    }
 
     summary->dataset_type = dataset_type;
     summary->size_bytes = size_bytes;
     summary->all_validation_pass = 1;
 
-    for (i = 0; i < RUNS_PER_CASE; i++) {
-        compression_ms_vals[i] = runs[i].compression_ms;
-        decompression_ms_vals[i] = runs[i].decompression_ms;
-        compressed_bytes_vals[i] = runs[i].compressed_bytes;
-        ratio_vals[i] = runs[i].ratio;
-        compress_deltas[i] = runs[i].compress_sched;
-        decompress_deltas[i] = runs[i].decompress_sched;
-
+    for (i = 0; i < run_count; i++) {
+        comp_wall[i] = runs[i].compress.wall_ms;
+        decomp_wall[i] = runs[i].decompress.wall_ms;
+        comp_thread_cpu[i] = runs[i].compress.thread_cpu_ms;
+        decomp_thread_cpu[i] = runs[i].decompress.thread_cpu_ms;
+        comp_proc_cpu[i] = runs[i].compress.process_cpu_ms;
+        decomp_proc_cpu[i] = runs[i].decompress.process_cpu_ms;
+        ratio[i] = runs[i].ratio;
+        compressed_bytes[i] = runs[i].compressed_bytes;
         if (!runs[i].validation_pass) {
             summary->all_validation_pass = 0;
         }
     }
 
-    summary->compression_ms_median = median_double(compression_ms_vals, RUNS_PER_CASE);
-    summary->decompression_ms_median = median_double(decompression_ms_vals, RUNS_PER_CASE);
-    summary->compressed_bytes_median = median_ull(compressed_bytes_vals, RUNS_PER_CASE);
-    summary->ratio_median = median_double(ratio_vals, RUNS_PER_CASE);
-    summary->compress_sched_median = median_sched_delta(compress_deltas, RUNS_PER_CASE);
-    summary->decompress_sched_median = median_sched_delta(decompress_deltas, RUNS_PER_CASE);
+    if (median_double(comp_wall, (size_t)run_count, &summary->comp_wall_ms_median) != 0 ||
+        median_double(decomp_wall, (size_t)run_count, &summary->decomp_wall_ms_median) != 0 ||
+        median_double(comp_thread_cpu, (size_t)run_count, &summary->comp_thread_cpu_ms_median) != 0 ||
+        median_double(decomp_thread_cpu, (size_t)run_count, &summary->decomp_thread_cpu_ms_median) != 0 ||
+        median_double(comp_proc_cpu, (size_t)run_count, &summary->comp_proc_cpu_ms_median) != 0 ||
+        median_double(decomp_proc_cpu, (size_t)run_count, &summary->decomp_proc_cpu_ms_median) != 0 ||
+        median_double(ratio, (size_t)run_count, &summary->ratio_median) != 0 ||
+        median_ull(compressed_bytes, (size_t)run_count, &summary->compressed_bytes_median) != 0) {
+        free(comp_wall);
+        free(decomp_wall);
+        free(comp_thread_cpu);
+        free(decomp_thread_cpu);
+        free(comp_proc_cpu);
+        free(decomp_proc_cpu);
+        free(ratio);
+        free(compressed_bytes);
+        return -1;
+    }
 
+    summary->comp_mib_per_s_median =
+        ((double)size_bytes / 1048576.0) / (summary->comp_wall_ms_median / 1000.0);
+    summary->decomp_mib_per_s_median =
+        ((double)size_bytes / 1048576.0) / (summary->decomp_wall_ms_median / 1000.0);
+
+    free(comp_wall);
+    free(decomp_wall);
+    free(comp_thread_cpu);
+    free(decomp_thread_cpu);
+    free(comp_proc_cpu);
+    free(decomp_proc_cpu);
+    free(ratio);
+    free(compressed_bytes);
+
+    return 0;
+}
+
+static int build_size_ladder(size_t max_size, size_t **out_sizes, size_t *out_count)
+{
+    size_t count = 0;
+    size_t value = MIN_SIZE;
+    size_t *sizes;
+    size_t idx = 0;
+
+    while (value <= max_size) {
+        count++;
+        if (value > (SIZE_MAX / 2)) {
+            break;
+        }
+        value *= 2;
+    }
+
+    if (count == 0) {
+        return -1;
+    }
+
+    sizes = calloc(count, sizeof(*sizes));
+    if (!sizes) {
+        return -1;
+    }
+
+    value = MIN_SIZE;
+    while (idx < count) {
+        sizes[idx++] = value;
+        value *= 2;
+    }
+
+    *out_sizes = sizes;
+    *out_count = count;
     return 0;
 }
 
 static void print_table_header(void)
 {
     printf(
-        "%-11s %-10s %-10s %-12s %-12s %-10s\n",
+        "%-12s %-10s %-9s %-11s %-11s %-13s %-13s %-10s\n",
         "type",
         "size_bytes",
         "ratio",
-        "comp_ms",
-        "decomp_ms",
+        "comp_wall",
+        "decomp_wall",
+        "comp_cpu_thr",
+        "decomp_cpu_thr",
         "validation"
     );
     printf(
-        "%-11s %-10s %-10s %-12s %-12s %-10s\n",
+        "%-12s %-10s %-9s %-11s %-11s %-13s %-13s %-10s\n",
+        "------------",
+        "----------",
+        "---------",
         "-----------",
-        "----------",
-        "----------",
-        "------------",
-        "------------",
+        "-----------",
+        "-------------",
+        "-------------",
         "----------"
     );
 }
 
-static void print_case_summary_row(const struct case_summary *s)
+static void print_case_summary(const struct case_summary *s)
 {
     printf(
-        "%-11s %-10zu %-10.4f %-12.4f %-12.4f %-10s\n",
+        "%-12s %-10zu %-9.4f %-11.4f %-11.4f %-13.4f %-13.4f %-10s\n",
         s->dataset_type,
         s->size_bytes,
         s->ratio_median,
-        s->compression_ms_median,
-        s->decompression_ms_median,
+        s->comp_wall_ms_median,
+        s->decomp_wall_ms_median,
+        s->comp_thread_cpu_ms_median,
+        s->decomp_thread_cpu_ms_median,
         s->all_validation_pass ? "PASS" : "FAIL"
-    );
-}
-
-static void print_sched_medians(const struct case_summary *s)
-{
-    printf(
-        "  sched-compress: vruntime=%.6f sum_exec=%.6f switches=%lld voluntary=%lld involuntary=%lld\n",
-        s->compress_sched_median.vruntime,
-        s->compress_sched_median.sum_exec_runtime,
-        s->compress_sched_median.nr_switches,
-        s->compress_sched_median.nr_voluntary_switches,
-        s->compress_sched_median.nr_involuntary_switches
-    );
-    printf(
-        "  sched-decomp  : vruntime=%.6f sum_exec=%.6f switches=%lld voluntary=%lld involuntary=%lld\n",
-        s->decompress_sched_median.vruntime,
-        s->decompress_sched_median.sum_exec_runtime,
-        s->decompress_sched_median.nr_switches,
-        s->decompress_sched_median.nr_voluntary_switches,
-        s->decompress_sched_median.nr_involuntary_switches
     );
 }
 
 static int write_csv_header(FILE *csv)
 {
-    int rc;
-
-    rc = fprintf(
+    return fprintf(
         csv,
-        "dataset_type,size_bytes,runs,"
-        "compression_ms_median,decompression_ms_median,"
-        "compressed_bytes_median,ratio_median,validation,"
-        "compress_vruntime_median,compress_sum_exec_runtime_median,"
-        "compress_nr_switches_median,compress_nr_voluntary_switches_median,"
-        "compress_nr_involuntary_switches_median,"
-        "decompress_vruntime_median,decompress_sum_exec_runtime_median,"
-        "decompress_nr_switches_median,decompress_nr_voluntary_switches_median,"
-        "decompress_nr_involuntary_switches_median\n"
-    );
-
-    return rc < 0 ? -1 : 0;
+        "dataset_type,size_bytes,runs,warmups,"
+        "compressed_bytes_median,ratio_median,"
+        "comp_wall_ms_median,decomp_wall_ms_median,"
+        "comp_thread_cpu_ms_median,decomp_thread_cpu_ms_median,"
+        "comp_proc_cpu_ms_median,decomp_proc_cpu_ms_median,"
+        "comp_mib_per_s_median,decomp_mib_per_s_median,validation\n"
+    ) < 0 ? -1 : 0;
 }
 
-static int append_csv_row(FILE *csv, const struct case_summary *s)
+static int append_csv_row(FILE *csv, const struct case_summary *s, const struct options *opts)
 {
-    int rc;
-
-    rc = fprintf(
+    return fprintf(
         csv,
-        "%s,%zu,%d,%.6f,%.6f,%llu,%.8f,%s,"
-        "%.6f,%.6f,%lld,%lld,%lld,"
-        "%.6f,%.6f,%lld,%lld,%lld\n",
+        "%s,%zu,%d,%d,%llu,%.8f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%s\n",
         s->dataset_type,
         s->size_bytes,
-        RUNS_PER_CASE,
-        s->compression_ms_median,
-        s->decompression_ms_median,
+        opts->runs,
+        opts->warmups,
         s->compressed_bytes_median,
         s->ratio_median,
-        s->all_validation_pass ? "PASS" : "FAIL",
-        s->compress_sched_median.vruntime,
-        s->compress_sched_median.sum_exec_runtime,
-        s->compress_sched_median.nr_switches,
-        s->compress_sched_median.nr_voluntary_switches,
-        s->compress_sched_median.nr_involuntary_switches,
-        s->decompress_sched_median.vruntime,
-        s->decompress_sched_median.sum_exec_runtime,
-        s->decompress_sched_median.nr_switches,
-        s->decompress_sched_median.nr_voluntary_switches,
-        s->decompress_sched_median.nr_involuntary_switches
-    );
-
-    return rc < 0 ? -1 : 0;
+        s->comp_wall_ms_median,
+        s->decomp_wall_ms_median,
+        s->comp_thread_cpu_ms_median,
+        s->decomp_thread_cpu_ms_median,
+        s->comp_proc_cpu_ms_median,
+        s->decomp_proc_cpu_ms_median,
+        s->comp_mib_per_s_median,
+        s->decomp_mib_per_s_median,
+        s->all_validation_pass ? "PASS" : "FAIL"
+    ) < 0 ? -1 : 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    static const size_t sizes[] = {
-        1024,
-        2048,
-        4096,
-        8192,
-        16384,
-        32768,
-        65536,
-        131072,
-        262144,
-        524288,
-        1048576,
-        2097152,
-        4194304,
-        8388608,
-        16777216
+    static const enum dataset_kind datasets[] = {
+        DATASET_REPETITIVE,
+        DATASET_UNIQUE,
+        DATASET_MIXED_50_50,
     };
-    static const char *dataset_types[] = {"repetitive", "unique"};
 
-    size_t t;
-    size_t s;
+    struct options opts;
+    size_t *sizes = NULL;
+    size_t size_count = 0;
+    FILE *csv = NULL;
     int had_failure = 0;
-    FILE *csv;
+    size_t d;
+    size_t s;
 
-    if (check_lz4_available() != 0) {
-        fprintf(stderr, "error: lz4 CLI not found in PATH\n");
-        fprintf(stderr, "hint: install lz4 and re-run\n");
+    if (parse_options(argc, argv, &opts) != 0) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    if (opts.use_cpu_pin && pin_to_cpu(opts.cpu_id) != 0) {
+        fprintf(stderr, "error: failed to pin to cpu %ld: %s\n", opts.cpu_id, strerror(errno));
         return 1;
     }
 
@@ -716,98 +857,178 @@ int main(void)
         return 1;
     }
 
-    /* Clean old single-file artifacts to avoid confusion with suite outputs. */
-    unlink("compressor-monitor/test.txt.lz4");
-    unlink("compressor-monitor/test.txt.out");
+    if (build_size_ladder(opts.max_size, &sizes, &size_count) != 0) {
+        fprintf(stderr, "error: failed to build size ladder\n");
+        return 1;
+    }
 
     csv = fopen(RESULTS_CSV, "w");
     if (!csv) {
-        fprintf(stderr, "error: failed to open results CSV '%s': %s\n", RESULTS_CSV, strerror(errno));
+        fprintf(stderr, "error: failed to open '%s': %s\n", RESULTS_CSV, strerror(errno));
+        free(sizes);
         return 1;
     }
 
     if (write_csv_header(csv) != 0) {
-        fprintf(stderr, "error: failed to write CSV header\n");
+        fprintf(stderr, "error: failed to write csv header\n");
         fclose(csv);
+        free(sizes);
         return 1;
     }
 
-    printf("=== compressor-monitor synthetic benchmark (LZ4) ===\n");
-    printf("runs_per_case=%d sizes=1KB..16MB datasets=repetitive,unique\n\n", RUNS_PER_CASE);
+    printf("=== compressor-monitor synthetic benchmark (LZ4 in-process) ===\n");
+    printf(
+        "datasets=repetitive,unique,mixed_50_50 sizes=%zu runs=%d warmups=%d",
+        size_count,
+        opts.runs,
+        opts.warmups
+    );
+    if (opts.use_cpu_pin) {
+        printf(" cpu_pin=%ld", opts.cpu_id);
+    }
+    printf("\n\n");
+
     print_table_header();
 
-    for (t = 0; t < (sizeof(dataset_types) / sizeof(dataset_types[0])); t++) {
-        for (s = 0; s < (sizeof(sizes) / sizeof(sizes[0])); s++) {
-            const char *dataset_type = dataset_types[t];
+    for (d = 0; d < (sizeof(datasets) / sizeof(datasets[0])); d++) {
+        enum dataset_kind kind = datasets[d];
+
+        for (s = 0; s < size_count; s++) {
             size_t size_bytes = sizes[s];
-            char input_path[512];
-            char compressed_path[512];
-            char decompressed_path[512];
-            struct run_metrics runs[RUNS_PER_CASE];
+            const char *name = dataset_name(kind);
+            char sample_path[512];
+            unsigned long long sample_size = 0;
+            unsigned char *input_buf = NULL;
+            unsigned char *compressed_buf = NULL;
+            unsigned char *decompressed_buf = NULL;
+            struct run_metrics *measured_runs = NULL;
+            int compressed_capacity;
+            int total_iterations;
+            int iter;
+            int measured_idx = 0;
             struct case_summary summary;
-            size_t r;
 
-            if (generate_sample_if_needed(dataset_type, size_bytes, input_path, sizeof(input_path)) != 0) {
-                fprintf(
-                    stderr,
-                    "error: failed to generate sample type=%s size=%zu\n",
-                    dataset_type,
-                    size_bytes
-                );
+            if (generate_sample_if_needed(kind, size_bytes, sample_path, sizeof(sample_path)) != 0) {
+                fprintf(stderr, "error: failed to generate sample %s size=%zu\n", name, size_bytes);
                 fclose(csv);
+                free(sizes);
                 return 1;
             }
 
-            if (snprintf(compressed_path, sizeof(compressed_path), "%s.lz4.tmp", input_path) >= (int)sizeof(compressed_path)) {
+            if (file_size_bytes(sample_path, &sample_size) != 0 || sample_size != (unsigned long long)size_bytes) {
+                fprintf(stderr, "error: sample size mismatch for %s size=%zu\n", name, size_bytes);
                 fclose(csv);
+                free(sizes);
                 return 1;
             }
 
-            if (snprintf(decompressed_path, sizeof(decompressed_path), "%s.out.tmp", input_path) >= (int)sizeof(decompressed_path)) {
+            input_buf = malloc(size_bytes);
+            if (!input_buf) {
+                fprintf(stderr, "error: input allocation failed size=%zu\n", size_bytes);
                 fclose(csv);
+                free(sizes);
                 return 1;
             }
 
-            for (r = 0; r < RUNS_PER_CASE; r++) {
-                if (benchmark_one_run(input_path, compressed_path, decompressed_path, &runs[r]) != 0) {
+            if (read_file_into_buffer(sample_path, input_buf, size_bytes) != 0) {
+                fprintf(stderr, "error: failed to read sample '%s'\n", sample_path);
+                free(input_buf);
+                fclose(csv);
+                free(sizes);
+                return 1;
+            }
+
+            compressed_capacity = LZ4_compressBound((int)size_bytes);
+            compressed_buf = malloc((size_t)compressed_capacity);
+            decompressed_buf = malloc(size_bytes);
+            measured_runs = calloc((size_t)opts.runs, sizeof(*measured_runs));
+
+            if (!compressed_buf || !decompressed_buf || !measured_runs) {
+                fprintf(stderr, "error: buffer allocation failed for size=%zu\n", size_bytes);
+                free(input_buf);
+                free(compressed_buf);
+                free(decompressed_buf);
+                free(measured_runs);
+                fclose(csv);
+                free(sizes);
+                return 1;
+            }
+
+            total_iterations = opts.warmups + opts.runs;
+            for (iter = 0; iter < total_iterations; iter++) {
+                struct run_metrics run;
+
+                if (run_one_iteration(
+                    input_buf,
+                    size_bytes,
+                    compressed_buf,
+                    (size_t)compressed_capacity,
+                    decompressed_buf,
+                    &run
+                ) != 0) {
                     fprintf(
                         stderr,
-                        "error: benchmark run failed type=%s size=%zu run=%zu\n",
-                        dataset_type,
+                        "error: benchmark failed dataset=%s size=%zu iteration=%d\n",
+                        name,
                         size_bytes,
-                        r + 1
+                        iter
                     );
-                    unlink(compressed_path);
-                    unlink(decompressed_path);
+                    free(input_buf);
+                    free(compressed_buf);
+                    free(decompressed_buf);
+                    free(measured_runs);
                     fclose(csv);
+                    free(sizes);
                     return 1;
                 }
 
-                unlink(compressed_path);
-                unlink(decompressed_path);
+                if (iter >= opts.warmups) {
+                    measured_runs[measured_idx++] = run;
+                }
             }
 
-            summarize_case(dataset_type, size_bytes, runs, &summary);
-            print_case_summary_row(&summary);
-            print_sched_medians(&summary);
-
-            if (append_csv_row(csv, &summary) != 0) {
-                fprintf(stderr, "error: failed to write CSV row\n");
+            if (summarize_case(name, size_bytes, measured_runs, opts.runs, &summary) != 0) {
+                fprintf(stderr, "error: failed to summarize case dataset=%s size=%zu\n", name, size_bytes);
+                free(input_buf);
+                free(compressed_buf);
+                free(decompressed_buf);
+                free(measured_runs);
                 fclose(csv);
+                free(sizes);
+                return 1;
+            }
+
+            print_case_summary(&summary);
+
+            if (append_csv_row(csv, &summary, &opts) != 0) {
+                fprintf(stderr, "error: failed to write csv row\n");
+                free(input_buf);
+                free(compressed_buf);
+                free(decompressed_buf);
+                free(measured_runs);
+                fclose(csv);
+                free(sizes);
                 return 1;
             }
 
             if (!summary.all_validation_pass) {
                 had_failure = 1;
             }
+
+            free(input_buf);
+            free(compressed_buf);
+            free(decompressed_buf);
+            free(measured_runs);
         }
     }
 
     fclose(csv);
+    free(sizes);
+
     printf("\nresults_csv: %s\n", RESULTS_CSV);
 
     if (had_failure) {
-        fprintf(stderr, "error: one or more benchmark cases failed validation\n");
+        fprintf(stderr, "error: one or more cases failed validation\n");
         return 1;
     }
 
