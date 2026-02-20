@@ -1152,6 +1152,8 @@ int main(int argc, char **argv)
                 unsigned char *decompressed_buf = NULL;
                 struct run_metrics *measured_runs = NULL;
                 size_t compressed_capacity;
+                int lz4_bound;
+                size_t zstd_bound;
                 int total_iterations;
                 int iter;
                 int measured_idx = 0;
@@ -1187,7 +1189,16 @@ int main(int argc, char **argv)
                     return 1;
                 }
 
-                compressed_capacity = ZSTD_compressBound(size_bytes);
+                lz4_bound = LZ4_compressBound((int)size_bytes);
+                if (lz4_bound <= 0) {
+                    fprintf(stderr, "error: LZ4_compressBound failed for size=%zu\n", size_bytes);
+                    free(input_buf);
+                    fclose(csv);
+                    free(sizes);
+                    return 1;
+                }
+                zstd_bound = ZSTD_compressBound(size_bytes);
+                compressed_capacity = (size_t)lz4_bound > zstd_bound ? (size_t)lz4_bound : zstd_bound;
                 compressed_buf = malloc(compressed_capacity);
                 decompressed_buf = malloc(size_bytes);
                 measured_runs = calloc((size_t)opts.runs, sizeof(*measured_runs));
