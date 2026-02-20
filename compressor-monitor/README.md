@@ -1,51 +1,36 @@
-# compressor-monitor (LZ4 synthetic suite)
+# compressor-monitor (LZ4 synthetic suite v2)
 
-This benchmark generates deterministic synthetic samples and measures LZ4 behavior across size and data-type patterns.
+This benchmark runs in-process LZ4 compression/decompression and reports wall-clock and CPU-time metrics for synthetic datasets.
 
-## What it benchmarks
+## Datasets
 
-- Datasets:
-  - `repetitive` (highly compressible repeated pattern)
-  - `unique` (deterministic PRNG bytes, near-incompressible)
-- Sizes:
-  - 1KB up to 16MB (powers of two)
-- Runs per case:
-  - 5
-- Summary:
-  - median metrics per case
+- `repetitive`: highly compressible repeated pattern
+- `unique`: deterministic PRNG bytes (near-incompressible)
+- `mixed_50_50`: deterministic interleaving of repetitive/unique 4 KiB blocks with exact 50/50 byte split
+
+## Sizes and runs
+
+- Size ladder: powers of two from 1 KiB up to `--max-size` (default 16 MiB)
+- Warmups per case: `--warmups` (default `2`, excluded from summaries)
+- Measured runs per case: `--runs` (default `5`, median reported)
 
 ## Metrics reported
 
-- File/ratio:
-  - median compressed bytes
-  - median compression ratio (`compressed_bytes / input_bytes`)
-- Timing:
-  - median `compression_ms`
-  - median `decompression_ms`
-- Scheduler deltas from `/proc/self/sched`:
-  - `se.vruntime`
-  - `se.sum_exec_runtime`
-  - `nr_switches`
-  - `nr_voluntary_switches`
-  - `nr_involuntary_switches`
-- Validation:
-  - byte-for-byte input/decompressed match for each run
+- `compressed_bytes_median`, `ratio_median`
+- `comp_wall_ms_median`, `decomp_wall_ms_median`
+- `comp_thread_cpu_ms_median`, `decomp_thread_cpu_ms_median`
+- `comp_proc_cpu_ms_median`, `decomp_proc_cpu_ms_median`
+- `comp_mib_per_s_median`, `decomp_mib_per_s_median`
+- `validation` (`PASS`/`FAIL`)
 
 ## Output
 
-- Terminal table with one row per `(dataset_type, size)` plus scheduler median lines.
-- CSV file: `compressor-monitor/results.csv`
-
-## Artifact policy
-
-- Kept:
-  - Generated input samples in `compressor-monitor/samples/`
-- Cleaned per run:
-  - Temporary compressed/decompressed outputs (`*.lz4.tmp`, `*.out.tmp`)
+- Terminal table (compact key medians)
+- CSV at `compressor-monitor/results.csv`
 
 ## Requirements
 
-- `lz4` CLI available in `PATH`
+- `liblz4` development library (for `lz4.h` + `-llz4`)
 - C compiler (`cc`)
 
 ## Build
@@ -58,6 +43,12 @@ make -C compressor-monitor
 
 ```bash
 ./compressor-monitor/compressor_monitor
+```
+
+Optional flags:
+
+```bash
+./compressor-monitor/compressor_monitor --cpu 0 --runs 5 --warmups 2 --max-size 16777216
 ```
 
 ## Cleanup
