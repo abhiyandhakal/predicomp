@@ -1,5 +1,6 @@
 proc_create
 page_fault
+swap_probe
 vmlinux.h
 src/*.o
 src/*.skel.h
