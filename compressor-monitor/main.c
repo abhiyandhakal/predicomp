@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 #include <lz4.h>
+#include <lz4hc.h>
+#include <zstd.h>
 
 #define RESULTS_CSV "compressor-monitor/results.csv"
 #define SAMPLES_DIR "compressor-monitor/samples"
@@ -20,11 +22,17 @@
 #define DEFAULT_MAX_SIZE (16U * 1024U * 1024U)
 #define MIN_SIZE 1024U
 #define MIX_BLOCK_SIZE 4096U
+#define MAX_PROFILES 64
 
 enum dataset_kind {
     DATASET_REPETITIVE = 0,
     DATASET_UNIQUE = 1,
     DATASET_MIXED_50_50 = 2,
+};
+
+enum codec_kind {
+    CODEC_LZ4 = 0,
+    CODEC_ZSTD = 1,
 };
 
 struct options {
@@ -33,6 +41,15 @@ struct options {
     size_t max_size;
     int use_cpu_pin;
     long cpu_id;
+    int use_lz4;
+    int use_zstd;
+};
+
+struct profile {
+    enum codec_kind codec;
+    const char *codec_name;
+    const char *mode_name;
+    int level;
 };
 
 struct phase_metrics {
@@ -50,6 +67,9 @@ struct run_metrics {
 };
 
 struct case_summary {
+    const char *codec;
+    const char *mode;
+    int level;
     const char *dataset_type;
     size_t size_bytes;
     unsigned long long compressed_bytes_median;
@@ -82,7 +102,10 @@ struct unique_state {
 
 static void print_usage(const char *prog)
 {
-    printf("Usage: %s [--cpu <id>] [--runs <n>] [--warmups <n>] [--max-size <bytes>]\n", prog);
+    printf(
+        "Usage: %s [--cpu <id>] [--runs <n>] [--warmups <n>] [--max-size <bytes>] [--codecs lz4,zstd] [--full-sweep]\n",
+        prog
+    );
 }
 
 static int parse_positive_int(const char *value, int *out)
@@ -100,18 +123,18 @@ static int parse_positive_int(const char *value, int *out)
     return 0;
 }
 
-static int parse_non_negative_int(const char *value, int *out)
+static int parse_non_negative_long(const char *value, long *out)
 {
     char *end = NULL;
     long parsed;
 
     errno = 0;
     parsed = strtol(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > 1000000L) {
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0L) {
         return -1;
     }
 
-    *out = (int)parsed;
+    *out = parsed;
     return 0;
 }
 
@@ -130,6 +153,29 @@ static int parse_positive_size(const char *value, size_t *out)
     return 0;
 }
 
+static int parse_codec_list(const char *value, int *use_lz4, int *use_zstd)
+{
+    if (strcmp(value, "lz4") == 0) {
+        *use_lz4 = 1;
+        *use_zstd = 0;
+        return 0;
+    }
+
+    if (strcmp(value, "zstd") == 0) {
+        *use_lz4 = 0;
+        *use_zstd = 1;
+        return 0;
+    }
+
+    if (strcmp(value, "lz4,zstd") == 0 || strcmp(value, "zstd,lz4") == 0) {
+        *use_lz4 = 1;
+        *use_zstd = 1;
+        return 0;
+    }
+
+    return -1;
+}
+
 static int parse_options(int argc, char **argv, struct options *opts)
 {
     int i;
@@ -139,15 +185,14 @@ static int parse_options(int argc, char **argv, struct options *opts)
     opts->max_size = DEFAULT_MAX_SIZE;
     opts->use_cpu_pin = 0;
     opts->cpu_id = -1;
+    opts->use_lz4 = 1;
+    opts->use_zstd = 1;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--cpu") == 0) {
-            int parsed_cpu = 0;
-
-            if (i + 1 >= argc || parse_non_negative_int(argv[i + 1], &parsed_cpu) != 0) {
+            if (i + 1 >= argc || parse_non_negative_long(argv[i + 1], &opts->cpu_id) != 0) {
                 return -1;
             }
-            opts->cpu_id = parsed_cpu;
             opts->use_cpu_pin = 1;
             i++;
         } else if (strcmp(argv[i], "--runs") == 0) {
@@ -156,8 +201,15 @@ static int parse_options(int argc, char **argv, struct options *opts)
             }
             i++;
         } else if (strcmp(argv[i], "--warmups") == 0) {
-            if (i + 1 >= argc || parse_non_negative_int(argv[i + 1], &opts->warmups) != 0) {
+            if (i + 1 >= argc) {
                 return -1;
+            }
+            {
+                long parsed = 0;
+                if (parse_non_negative_long(argv[i + 1], &parsed) != 0 || parsed > 1000000L) {
+                    return -1;
+                }
+                opts->warmups = (int)parsed;
             }
             i++;
         } else if (strcmp(argv[i], "--max-size") == 0) {
@@ -165,6 +217,13 @@ static int parse_options(int argc, char **argv, struct options *opts)
                 return -1;
             }
             i++;
+        } else if (strcmp(argv[i], "--codecs") == 0) {
+            if (i + 1 >= argc || parse_codec_list(argv[i + 1], &opts->use_lz4, &opts->use_zstd) != 0) {
+                return -1;
+            }
+            i++;
+        } else if (strcmp(argv[i], "--full-sweep") == 0) {
+            /* Default behavior is already full sweep. */
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -174,6 +233,10 @@ static int parse_options(int argc, char **argv, struct options *opts)
     }
 
     if (opts->max_size < MIN_SIZE) {
+        return -1;
+    }
+
+    if (!opts->use_lz4 && !opts->use_zstd) {
         return -1;
     }
 
@@ -502,6 +565,7 @@ static double diff_ms(const struct timespec *start, const struct timespec *end)
 }
 
 static int measure_lz4_compress(
+    const struct profile *profile,
     const unsigned char *input,
     int input_size,
     unsigned char *compressed,
@@ -518,12 +582,23 @@ static int measure_lz4_compress(
         return -1;
     }
 
-    out_size = LZ4_compress_default(
-        (const char *)input,
-        (char *)compressed,
-        input_size,
-        compressed_capacity
-    );
+    if (strcmp(profile->mode_name, "fast") == 0) {
+        out_size = LZ4_compress_fast(
+            (const char *)input,
+            (char *)compressed,
+            input_size,
+            compressed_capacity,
+            profile->level
+        );
+    } else {
+        out_size = LZ4_compress_HC(
+            (const char *)input,
+            (char *)compressed,
+            input_size,
+            compressed_capacity,
+            profile->level
+        );
+    }
 
     if (capture_clocks(&end) != 0) {
         return -1;
@@ -579,7 +654,77 @@ static int measure_lz4_decompress(
     return 0;
 }
 
+static int measure_zstd_compress(
+    const struct profile *profile,
+    const unsigned char *input,
+    size_t input_size,
+    unsigned char *compressed,
+    size_t compressed_capacity,
+    size_t *compressed_size,
+    struct phase_metrics *metrics
+)
+{
+    struct clock_snapshot start;
+    struct clock_snapshot end;
+    size_t out_size;
+
+    if (capture_clocks(&start) != 0) {
+        return -1;
+    }
+
+    out_size = ZSTD_compress(compressed, compressed_capacity, input, input_size, profile->level);
+
+    if (capture_clocks(&end) != 0) {
+        return -1;
+    }
+
+    if (ZSTD_isError(out_size)) {
+        return -1;
+    }
+
+    metrics->wall_ms = diff_ms(&start.wall, &end.wall);
+    metrics->thread_cpu_ms = diff_ms(&start.thread_cpu, &end.thread_cpu);
+    metrics->process_cpu_ms = diff_ms(&start.process_cpu, &end.process_cpu);
+    *compressed_size = out_size;
+
+    return 0;
+}
+
+static int measure_zstd_decompress(
+    const unsigned char *compressed,
+    size_t compressed_size,
+    unsigned char *decompressed,
+    size_t expected_decompressed_size,
+    struct phase_metrics *metrics
+)
+{
+    struct clock_snapshot start;
+    struct clock_snapshot end;
+    size_t out_size;
+
+    if (capture_clocks(&start) != 0) {
+        return -1;
+    }
+
+    out_size = ZSTD_decompress(decompressed, expected_decompressed_size, compressed, compressed_size);
+
+    if (capture_clocks(&end) != 0) {
+        return -1;
+    }
+
+    if (ZSTD_isError(out_size) || out_size != expected_decompressed_size) {
+        return -1;
+    }
+
+    metrics->wall_ms = diff_ms(&start.wall, &end.wall);
+    metrics->thread_cpu_ms = diff_ms(&start.thread_cpu, &end.thread_cpu);
+    metrics->process_cpu_ms = diff_ms(&start.process_cpu, &end.process_cpu);
+
+    return 0;
+}
+
 static int run_one_iteration(
+    const struct profile *profile,
     const unsigned char *input,
     size_t input_size,
     unsigned char *compressed,
@@ -588,39 +733,70 @@ static int run_one_iteration(
     struct run_metrics *out
 )
 {
-    int compressed_size;
-
     memset(out, 0, sizeof(*out));
 
-    if (measure_lz4_compress(
-        input,
-        (int)input_size,
-        compressed,
-        (int)compressed_capacity,
-        &compressed_size,
-        &out->compress
-    ) != 0) {
-        return -1;
+    if (profile->codec == CODEC_LZ4) {
+        int compressed_size = 0;
+
+        if (measure_lz4_compress(
+            profile,
+            input,
+            (int)input_size,
+            compressed,
+            (int)compressed_capacity,
+            &compressed_size,
+            &out->compress
+        ) != 0) {
+            return -1;
+        }
+
+        if (measure_lz4_decompress(
+            compressed,
+            compressed_size,
+            decompressed,
+            (int)input_size,
+            &out->decompress
+        ) != 0) {
+            return -1;
+        }
+
+        out->compressed_bytes = (unsigned long long)compressed_size;
+    } else {
+        size_t compressed_size = 0;
+
+        if (measure_zstd_compress(
+            profile,
+            input,
+            input_size,
+            compressed,
+            compressed_capacity,
+            &compressed_size,
+            &out->compress
+        ) != 0) {
+            return -1;
+        }
+
+        if (measure_zstd_decompress(
+            compressed,
+            compressed_size,
+            decompressed,
+            input_size,
+            &out->decompress
+        ) != 0) {
+            return -1;
+        }
+
+        out->compressed_bytes = (unsigned long long)compressed_size;
     }
 
-    if (measure_lz4_decompress(
-        compressed,
-        compressed_size,
-        decompressed,
-        (int)input_size,
-        &out->decompress
-    ) != 0) {
-        return -1;
-    }
-
-    out->compressed_bytes = (unsigned long long)compressed_size;
-    out->ratio = (double)compressed_size / (double)input_size;
+    out->ratio = (double)out->compressed_bytes / (double)input_size;
     out->validation_pass = (memcmp(input, decompressed, input_size) == 0);
 
     return out->validation_pass ? 0 : -1;
 }
 
 static int summarize_case(
+    const struct profile *profile,
     const char *dataset_type,
     size_t size_bytes,
     const struct run_metrics *runs,
@@ -660,6 +836,9 @@ static int summarize_case(
         return -1;
     }
 
+    summary->codec = profile->codec_name;
+    summary->mode = profile->mode_name;
+    summary->level = profile->level;
     summary->dataset_type = dataset_type;
     summary->size_bytes = size_bytes;
     summary->all_validation_pass = 1;
@@ -749,28 +928,82 @@ static int build_size_ladder(size_t max_size, size_t **out_sizes, size_t *out_co
     return 0;
 }
 
+static int build_profiles(const struct options *opts, struct profile *profiles, size_t *count)
+{
+    size_t idx = 0;
+    static const int lz4_fast_levels[] = {1, 2, 4, 8, 16};
+    static const int lz4_hc_levels[] = {3, 6, 9, 12};
+    int i;
+
+    if (opts->use_lz4) {
+        for (i = 0; i < (int)(sizeof(lz4_fast_levels) / sizeof(lz4_fast_levels[0])); i++) {
+            if (idx >= MAX_PROFILES) {
+                return -1;
+            }
+            profiles[idx].codec = CODEC_LZ4;
+            profiles[idx].codec_name = "lz4";
+            profiles[idx].mode_name = "fast";
+            profiles[idx].level = lz4_fast_levels[i];
+            idx++;
+        }
+
+        for (i = 0; i < (int)(sizeof(lz4_hc_levels) / sizeof(lz4_hc_levels[0])); i++) {
+            if (idx >= MAX_PROFILES) {
+                return -1;
+            }
+            profiles[idx].codec = CODEC_LZ4;
+            profiles[idx].codec_name = "lz4";
+            profiles[idx].mode_name = "hc";
+            profiles[idx].level = lz4_hc_levels[i];
+            idx++;
+        }
+    }
+
+    if (opts->use_zstd) {
+        for (i = 1; i <= 19; i++) {
+            if (idx >= MAX_PROFILES) {
+                return -1;
+            }
+            profiles[idx].codec = CODEC_ZSTD;
+            profiles[idx].codec_name = "zstd";
+            profiles[idx].mode_name = "level";
+            profiles[idx].level = i;
+            idx++;
+        }
+    }
+
+    if (idx == 0) {
+        return -1;
+    }
+
+    *count = idx;
+    return 0;
+}
+
 static void print_table_header(void)
 {
     printf(
-        "%-12s %-10s %-9s %-11s %-11s %-13s %-13s %-10s\n",
-        "type",
+        "%-6s %-6s %-5s %-12s %-10s %-9s %-11s %-11s %-10s\n",
+        "codec",
+        "mode",
+        "level",
+        "dataset",
         "size_bytes",
         "ratio",
-        "comp_wall",
-        "decomp_wall",
-        "comp_cpu_thr",
-        "decomp_cpu_thr",
-        "validation"
+        "comp_ms",
+        "decomp_ms",
+        "valid"
     );
     printf(
-        "%-12s %-10s %-9s %-11s %-11s %-13s %-13s %-10s\n",
+        "%-6s %-6s %-5s %-12s %-10s %-9s %-11s %-11s %-10s\n",
+        "------",
+        "------",
+        "-----",
         "------------",
         "----------",
         "---------",
         "-----------",
         "-----------",
-        "-------------",
-        "-------------",
         "----------"
     );
 }
@@ -778,14 +1011,15 @@ static void print_table_header(void)
 static void print_case_summary(const struct case_summary *s)
 {
     printf(
-        "%-12s %-10zu %-9.4f %-11.4f %-11.4f %-13.4f %-13.4f %-10s\n",
+        "%-6s %-6s %-5d %-12s %-10zu %-9.4f %-11.4f %-11.4f %-10s\n",
+        s->codec,
+        s->mode,
+        s->level,
         s->dataset_type,
         s->size_bytes,
         s->ratio_median,
         s->comp_wall_ms_median,
         s->decomp_wall_ms_median,
-        s->comp_thread_cpu_ms_median,
-        s->decomp_thread_cpu_ms_median,
         s->all_validation_pass ? "PASS" : "FAIL"
     );
 }
@@ -794,7 +1028,7 @@ static int write_csv_header(FILE *csv)
 {
     return fprintf(
         csv,
-        "dataset_type,size_bytes,runs,warmups,"
+        "codec,mode,level,dataset_type,size_bytes,runs,warmups,"
         "compressed_bytes_median,ratio_median,"
         "comp_wall_ms_median,decomp_wall_ms_median,"
         "comp_thread_cpu_ms_median,decomp_thread_cpu_ms_median,"
@@ -807,7 +1041,10 @@ static int append_csv_row(FILE *csv, const struct case_summary *s, const struct 
 {
     return fprintf(
         csv,
-        "%s,%zu,%d,%d,%llu,%.8f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%s\n",
+        "%s,%s,%d,%s,%zu,%d,%d,%llu,%.8f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%s\n",
+        s->codec,
+        s->mode,
+        s->level,
         s->dataset_type,
         s->size_bytes,
         opts->runs,
@@ -835,10 +1072,13 @@ int main(int argc, char **argv)
     };
 
     struct options opts;
+    struct profile profiles[MAX_PROFILES];
+    size_t profile_count = 0;
     size_t *sizes = NULL;
     size_t size_count = 0;
     FILE *csv = NULL;
     int had_failure = 0;
+    size_t p;
     size_t d;
     size_t s;
 
@@ -849,6 +1089,11 @@ int main(int argc, char **argv)
 
     if (opts.use_cpu_pin && pin_to_cpu(opts.cpu_id) != 0) {
         fprintf(stderr, "error: failed to pin to cpu %ld: %s\n", opts.cpu_id, strerror(errno));
+        return 1;
+    }
+
+    if (build_profiles(&opts, profiles, &profile_count) != 0) {
+        fprintf(stderr, "error: failed to build codec profiles\n");
         return 1;
     }
 
@@ -876,9 +1121,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("=== compressor-monitor synthetic benchmark (LZ4 in-process) ===\n");
+    printf("=== compressor-monitor level sweep ===\n");
     printf(
-        "datasets=repetitive,unique,mixed_50_50 sizes=%zu runs=%d warmups=%d",
+        "profiles=%zu datasets=3 sizes=%zu runs=%d warmups=%d",
+        profile_count,
         size_count,
         opts.runs,
         opts.warmups
@@ -890,88 +1136,119 @@ int main(int argc, char **argv)
 
     print_table_header();
 
-    for (d = 0; d < (sizeof(datasets) / sizeof(datasets[0])); d++) {
-        enum dataset_kind kind = datasets[d];
+    for (p = 0; p < profile_count; p++) {
+        const struct profile *profile = &profiles[p];
 
-        for (s = 0; s < size_count; s++) {
-            size_t size_bytes = sizes[s];
-            const char *name = dataset_name(kind);
-            char sample_path[512];
-            unsigned long long sample_size = 0;
-            unsigned char *input_buf = NULL;
-            unsigned char *compressed_buf = NULL;
-            unsigned char *decompressed_buf = NULL;
-            struct run_metrics *measured_runs = NULL;
-            int compressed_capacity;
-            int total_iterations;
-            int iter;
-            int measured_idx = 0;
-            struct case_summary summary;
+        for (d = 0; d < (sizeof(datasets) / sizeof(datasets[0])); d++) {
+            enum dataset_kind kind = datasets[d];
 
-            if (generate_sample_if_needed(kind, size_bytes, sample_path, sizeof(sample_path)) != 0) {
-                fprintf(stderr, "error: failed to generate sample %s size=%zu\n", name, size_bytes);
-                fclose(csv);
-                free(sizes);
-                return 1;
-            }
+            for (s = 0; s < size_count; s++) {
+                size_t size_bytes = sizes[s];
+                const char *name = dataset_name(kind);
+                char sample_path[512];
+                unsigned long long sample_size = 0;
+                unsigned char *input_buf = NULL;
+                unsigned char *compressed_buf = NULL;
+                unsigned char *decompressed_buf = NULL;
+                struct run_metrics *measured_runs = NULL;
+                size_t compressed_capacity;
+                int total_iterations;
+                int iter;
+                int measured_idx = 0;
+                struct case_summary summary;
 
-            if (file_size_bytes(sample_path, &sample_size) != 0 || sample_size != (unsigned long long)size_bytes) {
-                fprintf(stderr, "error: sample size mismatch for %s size=%zu\n", name, size_bytes);
-                fclose(csv);
-                free(sizes);
-                return 1;
-            }
+                if (generate_sample_if_needed(kind, size_bytes, sample_path, sizeof(sample_path)) != 0) {
+                    fprintf(stderr, "error: failed to generate sample %s size=%zu\n", name, size_bytes);
+                    fclose(csv);
+                    free(sizes);
+                    return 1;
+                }
 
-            input_buf = malloc(size_bytes);
-            if (!input_buf) {
-                fprintf(stderr, "error: input allocation failed size=%zu\n", size_bytes);
-                fclose(csv);
-                free(sizes);
-                return 1;
-            }
+                if (file_size_bytes(sample_path, &sample_size) != 0 || sample_size != (unsigned long long)size_bytes) {
+                    fprintf(stderr, "error: sample size mismatch for %s size=%zu\n", name, size_bytes);
+                    fclose(csv);
+                    free(sizes);
+                    return 1;
+                }
 
-            if (read_file_into_buffer(sample_path, input_buf, size_bytes) != 0) {
-                fprintf(stderr, "error: failed to read sample '%s'\n", sample_path);
-                free(input_buf);
-                fclose(csv);
-                free(sizes);
-                return 1;
-            }
+                input_buf = malloc(size_bytes);
+                if (!input_buf) {
+                    fprintf(stderr, "error: input allocation failed size=%zu\n", size_bytes);
+                    fclose(csv);
+                    free(sizes);
+                    return 1;
+                }
 
-            compressed_capacity = LZ4_compressBound((int)size_bytes);
-            compressed_buf = malloc((size_t)compressed_capacity);
-            decompressed_buf = malloc(size_bytes);
-            measured_runs = calloc((size_t)opts.runs, sizeof(*measured_runs));
+                if (read_file_into_buffer(sample_path, input_buf, size_bytes) != 0) {
+                    fprintf(stderr, "error: failed to read sample '%s'\n", sample_path);
+                    free(input_buf);
+                    fclose(csv);
+                    free(sizes);
+                    return 1;
+                }
 
-            if (!compressed_buf || !decompressed_buf || !measured_runs) {
-                fprintf(stderr, "error: buffer allocation failed for size=%zu\n", size_bytes);
-                free(input_buf);
-                free(compressed_buf);
-                free(decompressed_buf);
-                free(measured_runs);
-                fclose(csv);
-                free(sizes);
-                return 1;
-            }
+                compressed_capacity = ZSTD_compressBound(size_bytes);
+                compressed_buf = malloc(compressed_capacity);
+                decompressed_buf = malloc(size_bytes);
+                measured_runs = calloc((size_t)opts.runs, sizeof(*measured_runs));
 
-            total_iterations = opts.warmups + opts.runs;
-            for (iter = 0; iter < total_iterations; iter++) {
-                struct run_metrics run;
+                if (!compressed_buf || !decompressed_buf || !measured_runs) {
+                    fprintf(stderr, "error: buffer allocation failed for size=%zu\n", size_bytes);
+                    free(input_buf);
+                    free(compressed_buf);
+                    free(decompressed_buf);
+                    free(measured_runs);
+                    fclose(csv);
+                    free(sizes);
+                    return 1;
+                }
 
-                if (run_one_iteration(
-                    input_buf,
-                    size_bytes,
-                    compressed_buf,
-                    (size_t)compressed_capacity,
-                    decompressed_buf,
-                    &run
-                ) != 0) {
+                total_iterations = opts.warmups + opts.runs;
+                for (iter = 0; iter < total_iterations; iter++) {
+                    struct run_metrics run;
+
+                    if (run_one_iteration(
+                        profile,
+                        input_buf,
+                        size_bytes,
+                        compressed_buf,
+                        compressed_capacity,
+                        decompressed_buf,
+                        &run
+                    ) != 0) {
+                        fprintf(
+                            stderr,
+                            "error: benchmark failed codec=%s mode=%s level=%d dataset=%s size=%zu iteration=%d\n",
+                            profile->codec_name,
+                            profile->mode_name,
+                            profile->level,
+                            name,
+                            size_bytes,
+                            iter
+                        );
+                        free(input_buf);
+                        free(compressed_buf);
+                        free(decompressed_buf);
+                        free(measured_runs);
+                        fclose(csv);
+                        free(sizes);
+                        return 1;
+                    }
+
+                    if (iter >= opts.warmups) {
+                        measured_runs[measured_idx++] = run;
+                    }
+                }
+
+                if (summarize_case(profile, name, size_bytes, measured_runs, opts.runs, &summary) != 0) {
                     fprintf(
                         stderr,
-                        "error: benchmark failed dataset=%s size=%zu iteration=%d\n",
+                        "error: failed to summarize case codec=%s mode=%s level=%d dataset=%s size=%zu\n",
+                        profile->codec_name,
+                        profile->mode_name,
+                        profile->level,
                         name,
-                        size_bytes,
-                        iter
+                        size_bytes
                     );
                     free(input_buf);
                     free(compressed_buf);
@@ -982,43 +1259,28 @@ int main(int argc, char **argv)
                     return 1;
                 }
 
-                if (iter >= opts.warmups) {
-                    measured_runs[measured_idx++] = run;
+                print_case_summary(&summary);
+
+                if (append_csv_row(csv, &summary, &opts) != 0) {
+                    fprintf(stderr, "error: failed to write csv row\n");
+                    free(input_buf);
+                    free(compressed_buf);
+                    free(decompressed_buf);
+                    free(measured_runs);
+                    fclose(csv);
+                    free(sizes);
+                    return 1;
                 }
-            }
 
-            if (summarize_case(name, size_bytes, measured_runs, opts.runs, &summary) != 0) {
-                fprintf(stderr, "error: failed to summarize case dataset=%s size=%zu\n", name, size_bytes);
+                if (!summary.all_validation_pass) {
+                    had_failure = 1;
+                }
+
                 free(input_buf);
                 free(compressed_buf);
                 free(decompressed_buf);
                 free(measured_runs);
-                fclose(csv);
-                free(sizes);
-                return 1;
             }
-
-            print_case_summary(&summary);
-
-            if (append_csv_row(csv, &summary, &opts) != 0) {
-                fprintf(stderr, "error: failed to write csv row\n");
-                free(input_buf);
-                free(compressed_buf);
-                free(decompressed_buf);
-                free(measured_runs);
-                fclose(csv);
-                free(sizes);
-                return 1;
-            }
-
-            if (!summary.all_validation_pass) {
-                had_failure = 1;
-            }
-
-            free(input_buf);
-            free(compressed_buf);
-            free(decompressed_buf);
-            free(measured_runs);
         }
     }
 
