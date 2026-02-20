@@ -1,6 +1,12 @@
-# compressor-monitor (LZ4 synthetic suite v2)
+# compressor-monitor (LZ4 + Zstd level sweep)
 
-This benchmark runs in-process LZ4 compression/decompression and reports wall-clock and CPU-time metrics for synthetic datasets.
+This benchmark runs in-process compression/decompression sweeps for multiple levels across codecs.
+
+## Codecs and levels
+
+- LZ4 fast accelerations: `1,2,4,8,16`
+- LZ4 HC levels: `3,6,9,12`
+- Zstd levels: `1..19`
 
 ## Datasets
 
@@ -13,6 +19,7 @@ This benchmark runs in-process LZ4 compression/decompression and reports wall-cl
 - Size ladder: powers of two from 1 KiB up to `--max-size` (default 16 MiB)
 - Warmups per case: `--warmups` (default `2`, excluded from summaries)
 - Measured runs per case: `--runs` (default `5`, median reported)
+- Default run is full sweep across all configured codec levels
 
 ## Metrics reported
 
@@ -25,12 +32,17 @@ This benchmark runs in-process LZ4 compression/decompression and reports wall-cl
 
 ## Output
 
-- Terminal table (compact key medians)
-- CSV at `compressor-monitor/results.csv`
+- Terminal table with: `codec`, `mode`, `level`, `dataset`, size, ratio, timing, validation
+- Single CSV at `compressor-monitor/results.csv`
+
+CSV columns include codec metadata:
+
+- `codec,mode,level,dataset_type,size_bytes,runs,warmups,...`
 
 ## Requirements
 
-- `liblz4` development library (for `lz4.h` + `-llz4`)
+- `liblz4` development library
+- `libzstd` development library
 - C compiler (`cc`)
 
 ## Build
@@ -45,10 +57,16 @@ make -C compressor-monitor
 ./compressor-monitor/compressor_monitor
 ```
 
-Optional flags:
+Options:
 
 ```bash
-./compressor-monitor/compressor_monitor --cpu 0 --runs 5 --warmups 2 --max-size 16777216
+./compressor-monitor/compressor_monitor \
+  --codecs lz4,zstd \
+  --cpu 0 \
+  --runs 5 \
+  --warmups 2 \
+  --max-size 16777216 \
+  --full-sweep
 ```
 
 ## Cleanup
