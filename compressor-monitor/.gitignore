@@ -1,3 +1,7 @@
 compressor_monitor
+results.csv
 test.txt.lz4
 test.txt.out
+samples/*.bin
+samples/*.lz4.tmp
+samples/*.out.tmp
