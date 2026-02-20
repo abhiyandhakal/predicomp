@@ -4,8 +4,10 @@ This repository currently contains two small eBPF programs:
 
 - `proc_create`: prints `hello world <PID>` on process fork
 - `page_fault`: prints page fault events with PID, command name, user/kernel type, fault address, and instruction pointer
+- `swap_probe`: prints 1s swap/reclaim pressure deltas from `vmscan` tracepoints
 
-Both programs use `bpf_printk`, so output is read from `trace_pipe`.
+`proc_create` and `page_fault` use `bpf_printk`, so output is read from `trace_pipe`.
+`swap_probe` prints periodic summaries to stdout.
 
 ## Requirements
 
@@ -64,4 +66,21 @@ If `/sys/kernel/tracing/trace_pipe` does not exist, mount tracefs:
 
 ```bash
 sudo mount -t tracefs tracefs /sys/kernel/tracing
+```
+
+## Run swap/reclaim monitor
+
+This kernel does not expose direct `swapin/swapout` tracepoints, so `swap_probe`
+uses `vmscan` events as a practical proxy for swap pressure.
+
+Terminal 1:
+
+```bash
+sudo ./swap_probe
+```
+
+You should see lines like:
+
+```text
+swap_probe ts=1739983562 kswapd_wake=1 kswapd_sleep=0 direct_begin=3 direct_end=3 reclaim_pages=2 write_folio=1 last_pid=2104 last_comm=firefox
 ```
