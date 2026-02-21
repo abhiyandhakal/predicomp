@@ -111,3 +111,11 @@ Use `ram-pool/` to provision a dedicated zram-backed compressed RAM space and ru
 manual compression/readback triggers via workload profiles.
 
 See `ram-pool/README.md` for setup, status, trigger, and reset commands.
+
+## Swap-Free Managed Compression Arena
+
+Use `mem-arena/` for a custom user-space compression arena that does not depend on
+swap ingress. This is useful for controlled experiments with explicit compression
+and decompression triggers inside workload binaries.
+
+See `mem-arena/README.md` for API/build details and workload integration.

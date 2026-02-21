@@ -26,6 +26,8 @@ Run quick smoke checks:
 make -C workloads smoke
 ```
 
+Build also links `mem-arena/` so workload binaries can optionally run in swap-free managed compression mode.
+
 ## Custom workloads (C binaries)
 
 All binaries support strict defaults and common flags:
@@ -106,6 +108,29 @@ All binaries support strict defaults and common flags:
 - Start with `interactive_burst` and `anon_streamer` for predictive compression/decompression policy learning.
 - Add `fork_touch_exit` and `mmap_churn` to test robustness under process/mapping churn.
 - Use `random_touch_heap` as a worst-case random-access stress.
+
+## Optional swap-free mem-arena mode
+
+Two workloads support direct integration with `mem-arena`:
+
+- `bin/anon_streamer`
+- `bin/interactive_burst`
+
+Shared flags:
+
+- `--use-mem-arena`
+- `--arena-cap-mb <n>`
+- `--arena-min-savings-pct <n>`
+- `--arena-stats-json <path>`
+
+Examples:
+
+```bash
+./workloads/bin/anon_streamer --duration-sec 30 --region-mb 512 --use-mem-arena --arena-cap-mb 256 --arena-stats-json /tmp/anon_arena.json
+./workloads/bin/interactive_burst --duration-sec 30 --region-mb 256 --active-ms 100 --idle-ms 400 --use-mem-arena --arena-cap-mb 128 --arena-stats-json /tmp/burst_arena.json
+```
+
+See `mem-arena/README.md` for arena architecture and metric definitions.
 
 ## Safety model (strict by default)
 
