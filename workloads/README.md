@@ -36,26 +36,76 @@ All binaries support strict defaults and common flags:
 - `--json`
 - `--unsafe-allow-long` (required to exceed safe bounds)
 
+### Workload catalog
+
 ### 1) `bin/fork_exit_storm`
-Rate-limited fork/exit churn.
+- Intent: process lifecycle churn with minimal memory work.
+- Good for: validating fork trace volume and scheduler pressure.
+- Typical eBPF signals: `sched_process_fork`, run queue activity.
+- Example:
+```bash
+./workloads/bin/fork_exit_storm --duration-sec 30 --workers 4 --fork-rate 50
+```
 
 ### 2) `bin/fork_touch_exit`
-Fork churn where child touches configurable anonymous pages before exit.
+- Intent: process churn plus anonymous page touching before exit.
+- Good for: correlating process churn with page-fault/reclaim pressure.
+- Typical eBPF signals: `sched_process_fork` + `exceptions/page_fault_*` + `mm/vmscan/*`.
+- Example:
+```bash
+./workloads/bin/fork_touch_exit --duration-sec 30 --workers 4 --fork-rate 20 --touch-pages 256
+```
 
 ### 3) `bin/fork_exec_storm`
-Rate-limited `fork()+execve()` storms (default `/bin/true`).
+- Intent: repeated `fork()+execve()` to mimic helper/worker process trees.
+- Good for: browser-like isolated-process behavior approximation.
+- Typical eBPF signals: fork + exec transitions.
+- Example:
+```bash
+./workloads/bin/fork_exec_storm --duration-sec 30 --workers 2 --fork-rate 10 --exec-path /bin/true
+```
 
 ### 4) `bin/interactive_burst`
-Active touch bursts followed by idle windows (hot/cold/hot phases).
+- Intent: short active memory bursts followed by idle windows.
+- Good for: hot->cold->hot transitions relevant to early decompression.
+- Typical eBPF signals: fault bursts, then quiet periods, then bursts again.
+- Example:
+```bash
+./workloads/bin/interactive_burst --duration-sec 60 --region-mb 256 --active-ms 100 --idle-ms 500
+```
 
 ### 5) `bin/mmap_churn`
-Repeated `mmap/munmap` with page touches.
+- Intent: repeated `mmap/munmap` with page touching.
+- Good for: VMA churn and mapping lifecycle stress.
+- Typical eBPF signals: mm mapping churn + page faults.
+- Example:
+```bash
+./workloads/bin/mmap_churn --duration-sec 30 --map-kb 1024 --ops-per-sec 1000
+```
 
 ### 6) `bin/anon_streamer`
-Sequential page streaming with idle intervals.
+- Intent: sequential scan/touch over large anonymous memory with idle gaps.
+- Good for: controlled working-set passes and reclaim interaction.
+- Typical eBPF signals: sequential fault/re-access waves.
+- Example:
+```bash
+./workloads/bin/anon_streamer --duration-sec 60 --region-mb 1024 --idle-ms 300
+```
 
 ### 7) `bin/random_touch_heap`
-Random page touches over a large heap region.
+- Intent: random page touches over a large heap region.
+- Good for: latency-sensitive random access under memory pressure.
+- Typical eBPF signals: high-entropy access patterns and irregular fault locality.
+- Example:
+```bash
+./workloads/bin/random_touch_heap --duration-sec 60 --region-mb 1024 --ops-per-sec 500000
+```
+
+### Which one to use first
+
+- Start with `interactive_burst` and `anon_streamer` for predictive compression/decompression policy learning.
+- Add `fork_touch_exit` and `mmap_churn` to test robustness under process/mapping churn.
+- Use `random_touch_heap` as a worst-case random-access stress.
 
 ## Safety model (strict by default)
 
