@@ -51,7 +51,6 @@ struct options {
 };
 
 struct mem_snapshot {
-    uint64_t vmrss_kb;
     uint64_t vmhwm_kb;
     uint64_t rss_kb;
     uint64_t pss_kb;
@@ -439,9 +438,6 @@ static int read_smaps_rollup(struct mem_snapshot *snap)
 
 static int capture_mem_snapshot(struct mem_snapshot *snap)
 {
-    if (read_status_kb("VmRSS:", &snap->vmrss_kb) != 0) {
-        return -1;
-    }
     if (read_status_kb("VmHWM:", &snap->vmhwm_kb) != 0) {
         snap->vmhwm_kb = 0;
     }
@@ -894,8 +890,7 @@ static int write_csv_header(FILE *fp)
                    "dataset,run,warmup,pid,phase_model,region_mb,arena_cap_mb,min_savings_pct,"
                    "hot_fraction,partial_reread_fraction,random_reread_fraction,reuse_distance_pages,idle_ms,"
                    "latency_sample_step,"
-                   "vmrss_pre_kb,vmrss_post_comp_kb,vmrss_post_idle_kb,vmrss_post_partial_kb,vmrss_post_random_kb,"
-                   "vmrss_post_final_kb,vmhwm_post_final_kb,"
+                   "vmhwm_post_final_kb,"
                    "pss_pre_kb,pss_post_comp_kb,pss_post_idle_kb,pss_post_partial_kb,pss_post_random_kb,pss_post_final_kb,"
                    "rss_pre_kb,rss_post_comp_kb,rss_post_idle_kb,rss_post_partial_kb,rss_post_random_kb,rss_post_final_kb,"
                    "anon_pre_kb,anon_post_comp_kb,anon_post_idle_kb,anon_post_partial_kb,anon_post_random_kb,anon_post_final_kb,"
@@ -916,8 +911,8 @@ static int write_csv_header(FILE *fp)
 
 static int append_csv_row(FILE *fp, const struct options *opts, const char *dataset, const struct sample *s)
 {
-    long long rss_delta_comp = (long long)s->pre_comp.vmrss_kb - (long long)s->post_comp.vmrss_kb;
-    long long rss_delta_final = (long long)s->pre_comp.vmrss_kb - (long long)s->post_final.vmrss_kb;
+    long long rss_delta_comp = (long long)s->pre_comp.rss_kb - (long long)s->post_comp.rss_kb;
+    long long rss_delta_final = (long long)s->pre_comp.rss_kb - (long long)s->post_final.rss_kb;
 
     if (fprintf(fp,
                 "%s,%d,%d,%d,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,",
@@ -938,17 +933,11 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
         return -1;
     }
     if (fprintf(fp,
-                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+                "%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",",
-                s->pre_comp.vmrss_kb,
-                s->post_comp.vmrss_kb,
-                s->post_idle.vmrss_kb,
-                s->post_partial.vmrss_kb,
-                s->post_random.vmrss_kb,
-                s->post_final.vmrss_kb,
                 s->post_final.vmhwm_kb,
                 s->pre_comp.pss_kb,
                 s->post_comp.pss_kb,
@@ -1038,7 +1027,7 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
 
 static void print_header(void)
 {
-    printf("dataset      run warm phase_model               vmrss_pre_kb vmrss_post_comp_kb vmrss_post_final_kb ");
+    printf("dataset      run warm phase_model               rss_pre_kb rss_post_comp_kb rss_post_final_kb ");
     printf("comp_cpu_ms decomp_cpu_ms p99_ns faults_like decomp_ops incompressible\n");
     printf("------------ --- ---- ------------------------- ------------ ------------------ ------------------- ");
     printf("----------- ------------- ------ ----------- ---------- ------------\n");
@@ -1052,9 +1041,9 @@ static void print_row(const char *dataset, const struct sample *s, const struct 
            s->run_id,
            s->warmup,
            phase_model_name(opts->phase_model),
-           s->pre_comp.vmrss_kb,
-           s->post_comp.vmrss_kb,
-           s->post_final.vmrss_kb,
+           s->pre_comp.rss_kb,
+           s->post_comp.rss_kb,
+           s->post_final.rss_kb,
            s->compress_thread_cpu_ms,
            s->decompress_thread_cpu_ms,
            s->combined_latency.p99_ns,

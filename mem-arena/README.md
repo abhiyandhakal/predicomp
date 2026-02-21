@@ -106,7 +106,6 @@ These are designed to feed your fairness model and early-decompression policy id
 `process_mem_bench` measures, per run:
 
 - `/proc/self/status` snapshots:
-  - `VmRSS` across phases
   - `VmHWM` at final snapshot
 - `/proc/self/smaps_rollup` snapshots:
   - `Rss`, `Pss`, `Anonymous`, `File` across phases
