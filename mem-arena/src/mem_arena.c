@@ -219,6 +219,7 @@ static int compress_chunk(struct mem_arena *arena, int region_id, size_t chunk_i
     savings_pct = (int)(((long long)(arena->cfg.chunk_size - (size_t)out_size) * 100LL) /
                         (long long)arena->cfg.chunk_size);
     if (savings_pct < arena->cfg.min_savings_percent) {
+        arena->stats.incompressible_chunks++;
         arena->stats.compression_reject_small_gain++;
         free(tmp);
         return 0;

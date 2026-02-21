@@ -81,6 +81,11 @@ struct latency_stats {
     double avg_ns;
 };
 
+struct fault_counts {
+    uint64_t minflt;
+    uint64_t majflt;
+};
+
 struct sample {
     int run_id;
     int warmup;
@@ -101,9 +106,14 @@ struct sample {
     uint64_t readback_touches_total;
     uint64_t readback_touches_sampled;
     uint64_t readback_fault_like_events;
+    uint64_t stall_events_total;
+    uint64_t stall_events_sampled;
+    uint64_t minflt_delta;
+    uint64_t majflt_delta;
     struct latency_stats partial_latency;
     struct latency_stats random_latency;
     struct latency_stats combined_latency;
+    struct latency_stats stall_latency;
     struct mem_arena_stats arena_stats_post_comp;
     struct mem_arena_stats arena_stats;
 };
@@ -449,6 +459,55 @@ static int capture_mem_snapshot(struct mem_snapshot *snap)
     return 0;
 }
 
+static int read_fault_counts(struct fault_counts *out)
+{
+    FILE *fp;
+    char line[4096];
+    char *rp;
+    char *ctx;
+    char *tok;
+    int field = 3;
+    uint64_t minflt = 0;
+    uint64_t majflt = 0;
+    int have_minflt = 0;
+    int have_majflt = 0;
+
+    fp = fopen("/proc/self/stat", "r");
+    if (fp == NULL) {
+        return -1;
+    }
+    if (fgets(line, sizeof(line), fp) == NULL) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+
+    rp = strrchr(line, ')');
+    if (rp == NULL || rp[1] != ' ') {
+        return -1;
+    }
+
+    tok = strtok_r(rp + 2, " ", &ctx);
+    while (tok != NULL) {
+        if (field == 10) {
+            minflt = strtoull(tok, NULL, 10);
+            have_minflt = 1;
+        } else if (field == 12) {
+            majflt = strtoull(tok, NULL, 10);
+            have_majflt = 1;
+        }
+        if (have_minflt && have_majflt) {
+            out->minflt = minflt;
+            out->majflt = majflt;
+            return 0;
+        }
+        field++;
+        tok = strtok_r(NULL, " ", &ctx);
+    }
+
+    return -1;
+}
+
 static int snap_clocks(struct clocks *c)
 {
     if (clock_gettime(CLOCK_MONOTONIC, &c->wall) != 0) {
@@ -594,13 +653,23 @@ static int timed_touch(
     int op_kind,
     uint64_t *touch_idx,
     int sample_step,
-    struct latency_collector *collector,
-    uint64_t *sampled
+    uint64_t *out_ns,
+    int *out_sampled,
+    int *out_stall
 )
 {
     int rc;
+    int sample_now;
+    struct mem_arena_stats before_stats;
+    struct mem_arena_stats after_stats;
 
-    if ((*touch_idx % (uint64_t)sample_step) == 0U) {
+    if (mem_arena_get_stats(arena, &before_stats) != 0) {
+        return -1;
+    }
+
+    sample_now = ((*touch_idx % (uint64_t)sample_step) == 0U);
+
+    if (sample_now) {
         struct timespec t0;
         struct timespec t1;
 
@@ -614,16 +683,20 @@ static int timed_touch(
         if (rc != 0) {
             return -1;
         }
-        if (lc_push(collector, nsdiff(&t0, &t1)) != 0) {
-            return -1;
-        }
-        (*sampled)++;
+        *out_ns = nsdiff(&t0, &t1);
     } else {
         if (mem_arena_touch(arena, region_id, offset, op_kind) != 0) {
             return -1;
         }
+        *out_ns = 0;
     }
 
+    if (mem_arena_get_stats(arena, &after_stats) != 0) {
+        return -1;
+    }
+
+    *out_sampled = sample_now;
+    *out_stall = (after_stats.decompress_ops > before_stats.decompress_ops) ? 1 : 0;
     (*touch_idx)++;
     return 0;
 }
@@ -671,6 +744,9 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
     struct latency_collector partial_lc;
     struct latency_collector random_lc;
     struct latency_collector combined_lc;
+    struct latency_collector stall_lc;
+    struct fault_counts faults_before;
+    struct fault_counts faults_after;
     uint64_t touch_idx = 0;
     uint64_t seed;
 
@@ -681,6 +757,7 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
     lc_init(&partial_lc);
     lc_init(&random_lc);
     lc_init(&combined_lc);
+    lc_init(&stall_lc);
 
     cfg.arena_capacity_bytes = (size_t)opts->arena_mb * 1024UL * 1024UL;
     cfg.chunk_size = PAGE_SIZE;
@@ -744,23 +821,41 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
     if (snap_clocks(&d0) != 0) {
         goto fail;
     }
+    if (read_fault_counts(&faults_before) != 0) {
+        goto fail;
+    }
 
     if (opts->phase_model == PHASE_SINGLE_BULK || opts->phase_model == PHASE_HOT_IDLE_FULL_REREAD) {
         for (i = 0; i < total_pages; i++) {
             size_t off = i * PAGE_SIZE;
+            uint64_t latency_ns = 0;
+            int sampled = 0;
+            int stall = 0;
             if (timed_touch(arena,
                             region_id,
                             off,
                             MEM_ARENA_OP_XOR1,
                             &touch_idx,
                             opts->latency_sample_step,
-                            &combined_lc,
-                            &s->readback_touches_sampled) != 0) {
+                            &latency_ns,
+                            &sampled,
+                            &stall) != 0) {
                 goto fail;
             }
-            if (lc_push(&partial_lc, combined_lc.vals[combined_lc.count - 1]) != 0 &&
-                (touch_idx - 1U) % (uint64_t)opts->latency_sample_step == 0U) {
-                goto fail;
+            if (sampled) {
+                if (lc_push(&combined_lc, latency_ns) != 0 || lc_push(&partial_lc, latency_ns) != 0) {
+                    goto fail;
+                }
+                s->readback_touches_sampled++;
+            }
+            if (stall) {
+                s->stall_events_total++;
+                if (sampled) {
+                    if (lc_push(&stall_lc, latency_ns) != 0) {
+                        goto fail;
+                    }
+                    s->stall_events_sampled++;
+                }
             }
             s->readback_touches_total++;
         }
@@ -775,20 +870,33 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
 
         for (i = 0; i < partial_pages; i++) {
             size_t off = i * PAGE_SIZE;
-            uint64_t before_samples = s->readback_touches_sampled;
+            uint64_t latency_ns = 0;
+            int sampled = 0;
+            int stall = 0;
             if (timed_touch(arena,
                             region_id,
                             off,
                             MEM_ARENA_OP_XOR1,
                             &touch_idx,
                             opts->latency_sample_step,
-                            &combined_lc,
-                            &s->readback_touches_sampled) != 0) {
+                            &latency_ns,
+                            &sampled,
+                            &stall) != 0) {
                 goto fail;
             }
-            if (s->readback_touches_sampled > before_samples) {
-                if (lc_push(&partial_lc, combined_lc.vals[combined_lc.count - 1]) != 0) {
+            if (sampled) {
+                if (lc_push(&combined_lc, latency_ns) != 0 || lc_push(&partial_lc, latency_ns) != 0) {
                     goto fail;
+                }
+                s->readback_touches_sampled++;
+            }
+            if (stall) {
+                s->stall_events_total++;
+                if (sampled) {
+                    if (lc_push(&stall_lc, latency_ns) != 0) {
+                        goto fail;
+                    }
+                    s->stall_events_sampled++;
                 }
             }
             s->readback_touches_total++;
@@ -802,9 +910,11 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
         for (i = 0; i < random_touches; i++) {
             size_t page_idx;
             size_t off;
-            uint64_t before_samples;
+            uint64_t latency_ns = 0;
             uint64_t r = xorshift64(&seed);
             uint64_t dist = (uint64_t)opts->reuse_distance_pages;
+            int sampled = 0;
+            int stall = 0;
 
             page_idx = (size_t)(r % (uint64_t)total_pages);
             if (dist > 0 && total_pages > 0) {
@@ -817,20 +927,30 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
             }
             off = page_idx * PAGE_SIZE;
 
-            before_samples = s->readback_touches_sampled;
             if (timed_touch(arena,
                             region_id,
                             off,
                             MEM_ARENA_OP_XOR1,
                             &touch_idx,
                             opts->latency_sample_step,
-                            &combined_lc,
-                            &s->readback_touches_sampled) != 0) {
+                            &latency_ns,
+                            &sampled,
+                            &stall) != 0) {
                 goto fail;
             }
-            if (s->readback_touches_sampled > before_samples) {
-                if (lc_push(&random_lc, combined_lc.vals[combined_lc.count - 1]) != 0) {
+            if (sampled) {
+                if (lc_push(&combined_lc, latency_ns) != 0 || lc_push(&random_lc, latency_ns) != 0) {
                     goto fail;
+                }
+                s->readback_touches_sampled++;
+            }
+            if (stall) {
+                s->stall_events_total++;
+                if (sampled) {
+                    if (lc_push(&stall_lc, latency_ns) != 0) {
+                        goto fail;
+                    }
+                    s->stall_events_sampled++;
                 }
             }
             s->readback_touches_total++;
@@ -844,10 +964,19 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
     if (snap_clocks(&d1) != 0) {
         goto fail;
     }
+    if (read_fault_counts(&faults_after) != 0) {
+        goto fail;
+    }
 
     s->decompress_wall_ms = msdiff(&d0.wall, &d1.wall);
     s->decompress_thread_cpu_ms = msdiff(&d0.thread_cpu, &d1.thread_cpu);
     s->decompress_proc_cpu_ms = msdiff(&d0.process_cpu, &d1.process_cpu);
+    if (faults_after.minflt >= faults_before.minflt) {
+        s->minflt_delta = faults_after.minflt - faults_before.minflt;
+    }
+    if (faults_after.majflt >= faults_before.majflt) {
+        s->majflt_delta = faults_after.majflt - faults_before.majflt;
+    }
 
     if (capture_mem_snapshot(&s->post_final) != 0) {
         goto fail;
@@ -864,13 +993,15 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
 
     if (finalize_latency(&partial_lc, &s->partial_latency) != 0 ||
         finalize_latency(&random_lc, &s->random_latency) != 0 ||
-        finalize_latency(&combined_lc, &s->combined_latency) != 0) {
+        finalize_latency(&combined_lc, &s->combined_latency) != 0 ||
+        finalize_latency(&stall_lc, &s->stall_latency) != 0) {
         goto fail;
     }
 
     lc_free(&partial_lc);
     lc_free(&random_lc);
     lc_free(&combined_lc);
+    lc_free(&stall_lc);
     mem_arena_destroy(arena);
     return 0;
 
@@ -878,6 +1009,7 @@ fail:
     lc_free(&partial_lc);
     lc_free(&random_lc);
     lc_free(&combined_lc);
+    lc_free(&stall_lc);
     if (arena != NULL) {
         mem_arena_destroy(arena);
     }
@@ -900,8 +1032,10 @@ static int write_csv_header(FILE *fp)
                    "decompress_wall_ms,decompress_thread_cpu_ms,decompress_process_cpu_ms,"
                    "partial_samples,partial_p50_ns,partial_p95_ns,partial_p99_ns,partial_max_ns,"
                    "random_samples,random_p50_ns,random_p95_ns,random_p99_ns,random_max_ns,"
-                   "combined_samples,combined_p50_ns,combined_p95_ns,combined_p99_ns,combined_max_ns,"
+                   "touch_samples,touch_p50_ns,touch_p95_ns,touch_p99_ns,touch_max_ns,"
+                   "stall_samples,stall_p50_ns,stall_p95_ns,stall_p99_ns,stall_max_ns,"
                    "readback_touches_total,readback_touches_sampled,readback_fault_like_events,"
+                   "stall_events_total,stall_events_sampled,minflt_delta,majflt_delta,"
                    "compressed_bytes_post_compress,slot_bytes_post_compress,"
                    "logical_input_bytes,compressed_bytes_live,slot_bytes_live,compress_ops,decompress_ops,evictions_lru,"
                    "incompressible_chunks,access_hits_raw,access_hits_decompressed,compression_reject_small_gain\n") < 0
@@ -980,6 +1114,7 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
     if (fprintf(fp,
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",",
                 s->partial_latency.samples,
                 s->partial_latency.p50_ns,
@@ -995,14 +1130,23 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
                 s->combined_latency.p50_ns,
                 s->combined_latency.p95_ns,
                 s->combined_latency.p99_ns,
-                s->combined_latency.max_ns) < 0) {
+                s->combined_latency.max_ns,
+                s->stall_latency.samples,
+                s->stall_latency.p50_ns,
+                s->stall_latency.p95_ns,
+                s->stall_latency.p99_ns,
+                s->stall_latency.max_ns) < 0) {
         return -1;
     }
     if (fprintf(fp,
-                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",",
+                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",",
                 s->readback_touches_total,
                 s->readback_touches_sampled,
                 s->readback_fault_like_events,
+                s->stall_events_total,
+                s->stall_events_sampled,
+                s->minflt_delta,
+                s->majflt_delta,
                 s->compressed_bytes_post_compress,
                 s->slot_bytes_post_compress) < 0) {
         return -1;
@@ -1028,15 +1172,15 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
 static void print_header(void)
 {
     printf("dataset      run warm phase_model               rss_pre_kb rss_post_comp_kb rss_post_final_kb ");
-    printf("comp_cpu_ms decomp_cpu_ms p99_ns faults_like decomp_ops incompressible\n");
+    printf("comp_cpu_ms decomp_cpu_ms touch_p99_ns stall_p99_ns stall_events minflt majflt incompressible\n");
     printf("------------ --- ---- ------------------------- ------------ ------------------ ------------------- ");
-    printf("----------- ------------- ------ ----------- ---------- ------------\n");
+    printf("----------- ------------- ------------ ----------- ------------ ------ ------ ------------\n");
 }
 
 static void print_row(const char *dataset, const struct sample *s, const struct options *opts)
 {
-    printf("%-12s %3d %4d %-25s %12" PRIu64 " %18" PRIu64 " %19" PRIu64 " %11.3f %13.3f %6" PRIu64
-           " %11" PRIu64 " %10" PRIu64 " %12" PRIu64 "\n",
+    printf("%-12s %3d %4d %-25s %12" PRIu64 " %18" PRIu64 " %19" PRIu64 " %11.3f %13.3f %12" PRIu64
+           " %11" PRIu64 " %12" PRIu64 " %6" PRIu64 " %6" PRIu64 " %12" PRIu64 "\n",
            dataset,
            s->run_id,
            s->warmup,
@@ -1047,8 +1191,10 @@ static void print_row(const char *dataset, const struct sample *s, const struct 
            s->compress_thread_cpu_ms,
            s->decompress_thread_cpu_ms,
            s->combined_latency.p99_ns,
-           s->readback_fault_like_events,
-           s->arena_stats.decompress_ops,
+           s->stall_latency.p99_ns,
+           s->stall_events_total,
+           s->minflt_delta,
+           s->majflt_delta,
            s->arena_stats.incompressible_chunks);
 }
 

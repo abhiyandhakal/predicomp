@@ -94,10 +94,10 @@ Example:
 - `compress_ops`
 - `decompress_ops`
 - `evictions_lru`
-- `incompressible_chunks`
+- `incompressible_chunks` (chunks not admitted to compressed slots)
 - `access_hits_raw`
 - `access_hits_decompressed`
-- `compression_reject_small_gain`
+- `compression_reject_small_gain` (subset: rejected due to savings threshold)
 
 These are designed to feed your fairness model and early-decompression policy ideas.
 
@@ -115,7 +115,12 @@ These are designed to feed your fairness model and early-decompression policy id
 - latency percentiles for readback touches:
   - `partial_p50/p95/p99_ns`
   - `random_p50/p95/p99_ns`
-  - `combined_p50/p95/p99_ns`
+  - `touch_p50/p95/p99_ns` (all sampled readback touches)
+- decompression-triggered stall latency:
+  - `stall_p50/p95/p99_ns` (sampled touches that triggered decompression)
+  - `stall_events_total`, `stall_events_sampled`
+- true Linux page-fault counters (readback window deltas):
+  - `minflt_delta`, `majflt_delta` from `/proc/self/stat`
 - fault-like readback proxy:
   - `readback_fault_like_events` (delta of `access_hits_decompressed`)
 
