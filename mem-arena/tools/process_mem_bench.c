@@ -1027,7 +1027,7 @@ static int write_csv_header(FILE *fp)
                    "rss_pre_kb,rss_post_comp_kb,rss_post_idle_kb,rss_post_partial_kb,rss_post_random_kb,rss_post_final_kb,"
                    "anon_pre_kb,anon_post_comp_kb,anon_post_idle_kb,anon_post_partial_kb,anon_post_random_kb,anon_post_final_kb,"
                    "file_pre_kb,file_post_comp_kb,file_post_idle_kb,file_post_partial_kb,file_post_random_kb,file_post_final_kb,"
-                   "rss_delta_comp_kb,rss_delta_final_kb,"
+                   "pss_delta_comp_kb,pss_delta_final_kb,"
                    "compress_wall_ms,compress_thread_cpu_ms,compress_process_cpu_ms,"
                    "decompress_wall_ms,decompress_thread_cpu_ms,decompress_process_cpu_ms,"
                    "partial_samples,partial_p50_ns,partial_p95_ns,partial_p99_ns,partial_max_ns,"
@@ -1045,8 +1045,8 @@ static int write_csv_header(FILE *fp)
 
 static int append_csv_row(FILE *fp, const struct options *opts, const char *dataset, const struct sample *s)
 {
-    long long rss_delta_comp = (long long)s->pre_comp.rss_kb - (long long)s->post_comp.rss_kb;
-    long long rss_delta_final = (long long)s->pre_comp.rss_kb - (long long)s->post_final.rss_kb;
+    long long pss_delta_comp = (long long)s->pre_comp.pss_kb - (long long)s->post_comp.pss_kb;
+    long long pss_delta_final = (long long)s->pre_comp.pss_kb - (long long)s->post_final.pss_kb;
 
     if (fprintf(fp,
                 "%s,%d,%d,%d,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,",
@@ -1101,8 +1101,8 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
     }
     if (fprintf(fp,
                 "%lld,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,",
-                rss_delta_comp,
-                rss_delta_final,
+                pss_delta_comp,
+                pss_delta_final,
                 s->compress_wall_ms,
                 s->compress_thread_cpu_ms,
                 s->compress_proc_cpu_ms,
@@ -1171,7 +1171,7 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
 
 static void print_header(void)
 {
-    printf("dataset      run warm phase_model               rss_pre_kb rss_post_comp_kb rss_post_final_kb ");
+    printf("dataset      run warm phase_model               pss_pre_kb pss_post_comp_kb pss_post_final_kb ");
     printf("comp_cpu_ms decomp_cpu_ms touch_p99_ns stall_p99_ns stall_events minflt majflt incompressible\n");
     printf("------------ --- ---- ------------------------- ------------ ------------------ ------------------- ");
     printf("----------- ------------- ------------ ----------- ------------ ------ ------ ------------\n");
@@ -1185,9 +1185,9 @@ static void print_row(const char *dataset, const struct sample *s, const struct 
            s->run_id,
            s->warmup,
            phase_model_name(opts->phase_model),
-           s->pre_comp.rss_kb,
-           s->post_comp.rss_kb,
-           s->post_final.rss_kb,
+           s->pre_comp.pss_kb,
+           s->post_comp.pss_kb,
+           s->post_final.pss_kb,
            s->compress_thread_cpu_ms,
            s->decompress_thread_cpu_ms,
            s->combined_latency.p99_ns,
