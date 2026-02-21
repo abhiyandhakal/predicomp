@@ -7,7 +7,7 @@ LIBBPF_LIBS ?= $(shell pkg-config --libs libbpf 2>/dev/null)
 CFLAGS += -O2 -g -Wall -Wextra
 BPF_CFLAGS += -O2 -g -target bpf -D__TARGET_ARCH_x86
 
-.PHONY: all clean run run-page-fault run-swap-probe
+.PHONY: all clean run run-page-fault run-swap-probe workloads workloads-smoke
 
 all: proc_create page_fault swap_probe
 
@@ -50,5 +50,12 @@ run-page-fault: page_fault
 run-swap-probe: swap_probe
 	sudo ./swap_probe
 
+workloads:
+	$(MAKE) -C workloads
+
+workloads-smoke: workloads
+	$(MAKE) -C workloads smoke
+
 clean:
 	rm -f proc_create page_fault swap_probe vmlinux.h src/*.o src/*.skel.h
+	$(MAKE) -C workloads clean
