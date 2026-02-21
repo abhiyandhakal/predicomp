@@ -7,7 +7,7 @@ LIBBPF_LIBS ?= $(shell pkg-config --libs libbpf 2>/dev/null)
 CFLAGS += -O2 -g -Wall -Wextra
 BPF_CFLAGS += -O2 -g -target bpf -D__TARGET_ARCH_x86
 
-.PHONY: all clean run run-page-fault run-swap-probe workloads workloads-smoke ram-pool-status mem-arena mem-arena-demo
+.PHONY: all clean run run-page-fault run-swap-probe workloads workloads-smoke ram-pool-status mem-arena mem-arena-demo mem-arena-bench
 
 all: proc_create page_fault swap_probe
 
@@ -61,6 +61,9 @@ mem-arena:
 
 mem-arena-demo: mem-arena
 	$(MAKE) -C mem-arena demo
+
+mem-arena-bench: mem-arena
+	$(MAKE) -C mem-arena bench
 
 ram-pool-status:
 	./ram-pool/scripts/status_zram_pool.sh

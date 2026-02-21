@@ -6,6 +6,7 @@ ARFLAGS ?= rcs
 INCLUDE_DIR := include
 SRC_DIR := src
 EXAMPLE_DIR := examples
+TOOL_DIR := tools
 
 LIB := libmemarena.a
 LIB_SRCS := \
@@ -15,10 +16,11 @@ LIB_SRCS := \
 LIB_OBJS := $(LIB_SRCS:.c=.o)
 
 DEMO := arena_demo
+PROCESS_BENCH := process_mem_bench
 
-.PHONY: all clean demo
+.PHONY: all clean demo bench
 
-all: $(LIB) $(DEMO)
+all: $(LIB) $(DEMO) $(PROCESS_BENCH)
 
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -I$(INCLUDE_DIR) -I$(SRC_DIR) -c $< -o $@
@@ -29,8 +31,14 @@ $(LIB): $(LIB_OBJS)
 $(DEMO): $(EXAMPLE_DIR)/arena_demo.c $(LIB)
 	$(CC) $(CFLAGS) -I$(INCLUDE_DIR) $< -L. -lmemarena -llz4 -o $@
 
+$(PROCESS_BENCH): $(TOOL_DIR)/process_mem_bench.c $(LIB)
+	$(CC) $(CFLAGS) -I$(INCLUDE_DIR) $< -L. -lmemarena -llz4 -o $@
+
 demo: $(DEMO)
 	./$(DEMO)
 
+bench: $(PROCESS_BENCH)
+	./$(PROCESS_BENCH)
+
 clean:
-	rm -f $(LIB) $(LIB_OBJS) $(DEMO)
+	rm -f $(LIB) $(LIB_OBJS) $(DEMO) $(PROCESS_BENCH)

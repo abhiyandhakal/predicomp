@@ -1,3 +1,4 @@
 *.a
 *.o
 arena_demo
+process_mem_bench
