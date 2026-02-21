@@ -15,9 +15,10 @@ Prototype a controlled, page-like compression path to evaluate:
 
 - Region memory is allocated in user space.
 - Region is split into fixed-size chunks (default 4 KiB).
-- Compression moves a chunk from raw memory into arena slot storage.
+- Compression moves chunk payload into a packed variable-size pool (aligned extents).
 - Decompression restores chunk to raw memory on access.
-- If arena slots are full, least-recently-used compressed chunk is evicted (decompressed back to raw).
+- If pool is fragmented, compaction may run before allocation retry.
+- If pool capacity is pressured, least-recently-used compressed chunk is evicted (decompressed back to raw).
 
 ## Public API
 
@@ -90,7 +91,12 @@ Example:
 
 - `logical_input_bytes`
 - `compressed_bytes_live`
-- `slot_bytes_live`
+- `pool_bytes_live`
+- `pool_bytes_free`
+- `pool_bytes_fragmented`
+- `pool_largest_free_extent`
+- `pool_compactions`
+- `slot_bytes_live` (legacy alias of `pool_bytes_live`)
 - `compress_ops`
 - `decompress_ops`
 - `evictions_lru`
@@ -168,5 +174,5 @@ The measured process is the benchmark process itself (managed test process path)
 ## Limitations
 
 - Managed-buffer scope only (not transparent process-wide memory interception).
-- Current slot allocator uses fixed slot size equal to chunk size.
+- Memory reclaim hints (`madvise`) are best effort and kernel-dependent.
 - LZ4 is the only codec in this phase.

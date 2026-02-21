@@ -103,6 +103,11 @@ struct sample {
     double decompress_proc_cpu_ms;
     uint64_t compressed_bytes_post_compress;
     uint64_t slot_bytes_post_compress;
+    uint64_t pool_bytes_post_compress;
+    uint64_t pool_free_post_compress;
+    uint64_t pool_frag_post_compress;
+    uint64_t pool_largest_free_post_compress;
+    uint64_t pool_compactions_post_compress;
     uint64_t readback_touches_total;
     uint64_t readback_touches_sampled;
     uint64_t readback_fault_like_events;
@@ -797,6 +802,11 @@ static int run_one(const struct options *opts, const char *dataset, int run_id, 
     }
     s->compressed_bytes_post_compress = after_comp.compressed_bytes_live;
     s->slot_bytes_post_compress = after_comp.slot_bytes_live;
+    s->pool_bytes_post_compress = after_comp.pool_bytes_live;
+    s->pool_free_post_compress = after_comp.pool_bytes_free;
+    s->pool_frag_post_compress = after_comp.pool_bytes_fragmented;
+    s->pool_largest_free_post_compress = after_comp.pool_largest_free_extent;
+    s->pool_compactions_post_compress = after_comp.pool_compactions;
     s->arena_stats_post_comp = after_comp;
 
     s->compress_wall_ms = msdiff(&c0.wall, &c1.wall);
@@ -1037,7 +1047,11 @@ static int write_csv_header(FILE *fp)
                    "readback_touches_total,readback_touches_sampled,readback_fault_like_events,"
                    "stall_events_total,stall_events_sampled,minflt_delta,majflt_delta,"
                    "compressed_bytes_post_compress,slot_bytes_post_compress,"
-                   "logical_input_bytes,compressed_bytes_live,slot_bytes_live,compress_ops,decompress_ops,evictions_lru,"
+                   "pool_bytes_post_compress,pool_free_post_compress,pool_frag_post_compress,"
+                   "pool_largest_free_post_compress,pool_compactions_post_compress,"
+                   "logical_input_bytes,compressed_bytes_live,slot_bytes_live,pool_bytes_live,pool_bytes_free,"
+                   "pool_bytes_fragmented,pool_largest_free_extent,pool_compactions,"
+                   "compress_ops,decompress_ops,evictions_lru,"
                    "incompressible_chunks,access_hits_raw,access_hits_decompressed,compression_reject_small_gain\n") < 0
                ? -1
                : 0;
@@ -1139,7 +1153,8 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
         return -1;
     }
     if (fprintf(fp,
-                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",",
+                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",",
                 s->readback_touches_total,
                 s->readback_touches_sampled,
                 s->readback_fault_like_events,
@@ -1148,15 +1163,26 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
                 s->minflt_delta,
                 s->majflt_delta,
                 s->compressed_bytes_post_compress,
-                s->slot_bytes_post_compress) < 0) {
+                s->slot_bytes_post_compress,
+                s->pool_bytes_post_compress,
+                s->pool_free_post_compress,
+                s->pool_frag_post_compress,
+                s->pool_largest_free_post_compress,
+                s->pool_compactions_post_compress) < 0) {
         return -1;
     }
     if (fprintf(fp,
+                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                 s->arena_stats.logical_input_bytes,
                 s->arena_stats.compressed_bytes_live,
                 s->arena_stats.slot_bytes_live,
+                s->arena_stats.pool_bytes_live,
+                s->arena_stats.pool_bytes_free,
+                s->arena_stats.pool_bytes_fragmented,
+                s->arena_stats.pool_largest_free_extent,
+                s->arena_stats.pool_compactions,
                 s->arena_stats.compress_ops,
                 s->arena_stats.decompress_ops,
                 s->arena_stats.evictions_lru,

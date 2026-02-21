@@ -21,6 +21,11 @@ struct mem_arena_config {
 struct mem_arena_stats {
     uint64_t logical_input_bytes;
     uint64_t compressed_bytes_live;
+    uint64_t pool_bytes_live;
+    uint64_t pool_bytes_free;
+    uint64_t pool_bytes_fragmented;
+    uint64_t pool_largest_free_extent;
+    uint64_t pool_compactions;
     uint64_t slot_bytes_live;
     uint64_t compress_ops;
     uint64_t decompress_ops;
