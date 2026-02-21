@@ -101,17 +101,58 @@ Example:
 
 These are designed to feed your fairness model and early-decompression policy ideas.
 
-## Per-Process RAM + CPU Tracking
+## Per-Process RAM + CPU + Phase/Fault Tracking
 
 `process_mem_bench` measures, per run:
 
-- `VmRSS` before compression (`rss_pre_kb`)
-- `VmRSS` after compression (`rss_post_compress_kb`)
-- `VmRSS` after readback/decompression (`rss_post_readback_kb`)
-- `VmHWM` (`vmhwm_kb`)
+- `/proc/self/status` snapshots:
+  - `VmRSS` across phases
+  - `VmHWM` at final snapshot
+- `/proc/self/smaps_rollup` snapshots:
+  - `Rss`, `Pss`, `Anonymous`, `File` across phases
 - compression/decompression CPU and wall time:
   - `compress_thread_cpu_ms`, `compress_process_cpu_ms`, `compress_wall_ms`
   - `decompress_thread_cpu_ms`, `decompress_process_cpu_ms`, `decompress_wall_ms`
+- latency percentiles for readback touches:
+  - `partial_p50/p95/p99_ns`
+  - `random_p50/p95/p99_ns`
+  - `combined_p50/p95/p99_ns`
+- fault-like readback proxy:
+  - `readback_fault_like_events` (delta of `access_hits_decompressed`)
+
+Phase model options:
+
+- `--phase-model single-bulk`
+- `--phase-model hot-idle-full-reread`
+- `--phase-model hot-idle-partial-random` (default)
+
+Useful tuning flags:
+
+- `--hot-fraction`
+- `--partial-reread-fraction`
+- `--random-reread-fraction`
+- `--reuse-distance-pages`
+- `--idle-ms`
+- `--latency-sample-step`
+- `--seed`
+
+Example:
+
+```bash
+./mem-arena/process_mem_bench \
+  --dataset repetitive unique mixed_50_50 \
+  --region-mb 256 \
+  --arena-cap-mb 128 \
+  --runs 5 \
+  --warmups 2 \
+  --phase-model hot-idle-partial-random \
+  --hot-fraction 60 \
+  --partial-reread-fraction 30 \
+  --random-reread-fraction 20 \
+  --reuse-distance-pages 64 \
+  --latency-sample-step 8 \
+  --csv mem-arena/process_mem_bench.csv
+```
 
 It writes:
 
