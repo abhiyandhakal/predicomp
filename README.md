@@ -97,3 +97,10 @@ You should see lines like:
 ```text
 swap_probe ts=1739983562 kswapd_wake=1 kswapd_sleep=0 direct_begin=3 direct_end=3 reclaim_pages=2 write_folio=1 last_pid=2104 last_comm=firefox
 ```
+
+## Structured Workloads Lab
+
+Use `workloads/` for bounded process/memory workload generation plus wrappers for
+`stress-ng`, `mmtests`, `phoronix-test-suite`, `sysbench`, and `fio`.
+
+See `workloads/README.md` for build/run commands, safety guardrails, and citations.
