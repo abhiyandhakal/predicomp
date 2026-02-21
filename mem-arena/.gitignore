@@ -2,3 +2,5 @@
 *.o
 arena_demo
 process_mem_bench
+
+process_mem_bench.csv

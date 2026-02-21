@@ -16,6 +16,7 @@
 #define DEFAULT_MIN_SAVINGS_PCT 5
 #define DEFAULT_RUNS 5
 #define DEFAULT_WARMUPS 2
+#define MAX_DATASETS 8
 
 struct options {
     int region_mb;
@@ -23,7 +24,8 @@ struct options {
     int min_savings_pct;
     int runs;
     int warmups;
-    const char *dataset;
+    char datasets[MAX_DATASETS][32];
+    int dataset_count;
     const char *csv_path;
 };
 
@@ -54,9 +56,69 @@ struct clocks {
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s [--dataset repetitive|unique|mixed_50_50] [--region-mb N] [--arena-cap-mb N] "
+            "usage: %s [--dataset repetitive|unique|mixed_50_50|list] [--region-mb N] [--arena-cap-mb N] "
             "[--min-savings-pct N] [--runs N] [--warmups N] [--csv path]\n",
             prog);
+}
+
+static int is_valid_dataset(const char *name)
+{
+    return strcmp(name, "repetitive") == 0 || strcmp(name, "unique") == 0 || strcmp(name, "mixed_50_50") == 0;
+}
+
+static int add_dataset(struct options *opts, const char *name)
+{
+    int i;
+
+    if (!is_valid_dataset(name)) {
+        return -1;
+    }
+    for (i = 0; i < opts->dataset_count; i++) {
+        if (strcmp(opts->datasets[i], name) == 0) {
+            return 0;
+        }
+    }
+    if (opts->dataset_count >= MAX_DATASETS) {
+        return -1;
+    }
+    snprintf(opts->datasets[opts->dataset_count], sizeof(opts->datasets[0]), "%s", name);
+    opts->dataset_count++;
+    return 0;
+}
+
+static int add_dataset_arg(struct options *opts, const char *value)
+{
+    char *tmp;
+    char *src;
+    char *dst;
+    char *tok;
+
+    tmp = strdup(value);
+    if (tmp == NULL) {
+        return -1;
+    }
+
+    src = tmp;
+    dst = tmp;
+    while (*src != '\0') {
+        if (*src != '{' && *src != '}' && *src != ' ') {
+            *dst++ = *src;
+        }
+        src++;
+    }
+    *dst = '\0';
+
+    tok = strtok(tmp, ",");
+    while (tok != NULL) {
+        if (*tok != '\0' && add_dataset(opts, tok) != 0) {
+            free(tmp);
+            return -1;
+        }
+        tok = strtok(NULL, ",");
+    }
+
+    free(tmp);
+    return 0;
 }
 
 static int parse_pos_int(const char *name, const char *value, int min_v, int max_v)
@@ -80,12 +142,24 @@ static int parse_options(int argc, char **argv, struct options *opts)
     opts->min_savings_pct = DEFAULT_MIN_SAVINGS_PCT;
     opts->runs = DEFAULT_RUNS;
     opts->warmups = DEFAULT_WARMUPS;
-    opts->dataset = "repetitive";
+    opts->dataset_count = 0;
+    snprintf(opts->datasets[opts->dataset_count], sizeof(opts->datasets[0]), "%s", "repetitive");
+    opts->dataset_count++;
     opts->csv_path = "mem-arena/process_mem_bench.csv";
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dataset") == 0 && i + 1 < argc) {
-            opts->dataset = argv[++i];
+            int consumed = 0;
+            opts->dataset_count = 0;
+            while (i + 1 < argc && argv[i + 1][0] != '-') {
+                if (add_dataset_arg(opts, argv[++i]) != 0) {
+                    return -1;
+                }
+                consumed = 1;
+            }
+            if (!consumed || opts->dataset_count == 0) {
+                return -1;
+            }
         } else if (strcmp(argv[i], "--region-mb") == 0 && i + 1 < argc) {
             opts->region_mb = parse_pos_int("region-mb", argv[++i], 1, 65536);
         } else if (strcmp(argv[i], "--arena-cap-mb") == 0 && i + 1 < argc) {
@@ -106,8 +180,7 @@ static int parse_options(int argc, char **argv, struct options *opts)
         }
     }
 
-    if (strcmp(opts->dataset, "repetitive") != 0 && strcmp(opts->dataset, "unique") != 0 &&
-        strcmp(opts->dataset, "mixed_50_50") != 0) {
+    if (opts->dataset_count <= 0) {
         return -1;
     }
     return 0;
@@ -209,7 +282,7 @@ static double msdiff(const struct timespec *a, const struct timespec *b)
     return sec * 1000.0 + nsec / 1000000.0;
 }
 
-static int run_one(const struct options *opts, int run_id, int warmup, struct sample *s)
+static int run_one(const struct options *opts, const char *dataset, int run_id, int warmup, struct sample *s)
 {
     struct mem_arena_config cfg;
     struct mem_arena *arena = NULL;
@@ -238,7 +311,7 @@ static int run_one(const struct options *opts, int run_id, int warmup, struct sa
         return -1;
     }
 
-    fill_dataset(raw, len, opts->dataset);
+    fill_dataset(raw, len, dataset);
     for (off = 0; off < len; off += PAGE_SIZE) {
         raw[off] ^= 1;
     }
@@ -316,11 +389,11 @@ static int write_csv_header(FILE *fp)
                : 0;
 }
 
-static int append_csv_row(FILE *fp, const struct options *opts, const struct sample *s)
+static int append_csv_row(FILE *fp, const struct options *opts, const char *dataset, const struct sample *s)
 {
     long long delta = (long long)s->rss_pre_kb - (long long)s->rss_post_compress_kb;
 
-    if (fprintf(fp, "%s,%d,%d,%d,%d,%d,%d,", opts->dataset, s->run_id, s->warmup, (int)getpid(), opts->region_mb,
+    if (fprintf(fp, "%s,%d,%d,%d,%d,%d,%d,", dataset, s->run_id, s->warmup, (int)getpid(), opts->region_mb,
                 opts->arena_mb, opts->min_savings_pct) < 0) {
         return -1;
     }
@@ -380,6 +453,7 @@ static void print_row(const char *dataset, const struct sample *s)
 int main(int argc, char **argv)
 {
     struct options opts;
+    int d;
     int i;
     int total_runs;
     FILE *csv = NULL;
@@ -401,19 +475,23 @@ int main(int argc, char **argv)
 
     print_header();
     total_runs = opts.warmups + opts.runs;
-    for (i = 0; i < total_runs; i++) {
-        struct sample s;
-        int warmup = (i < opts.warmups) ? 1 : 0;
-        if (run_one(&opts, i + 1, warmup, &s) != 0) {
-            fprintf(stderr, "run failed at iteration %d\n", i + 1);
-            fclose(csv);
-            return 1;
-        }
-        print_row(opts.dataset, &s);
-        if (append_csv_row(csv, &opts, &s) != 0) {
-            fprintf(stderr, "failed to append CSV row\n");
-            fclose(csv);
-            return 1;
+    for (d = 0; d < opts.dataset_count; d++) {
+        const char *dataset = opts.datasets[d];
+        for (i = 0; i < total_runs; i++) {
+            struct sample s;
+            int warmup = (i < opts.warmups) ? 1 : 0;
+
+            if (run_one(&opts, dataset, i + 1, warmup, &s) != 0) {
+                fprintf(stderr, "run failed dataset=%s iteration=%d\n", dataset, i + 1);
+                fclose(csv);
+                return 1;
+            }
+            print_row(dataset, &s);
+            if (append_csv_row(csv, &opts, dataset, &s) != 0) {
+                fprintf(stderr, "failed to append CSV row\n");
+                fclose(csv);
+                return 1;
+            }
         }
     }
 

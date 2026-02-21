@@ -52,6 +52,18 @@ make -C mem-arena bench
 ./mem-arena/process_mem_bench --dataset repetitive --region-mb 256 --arena-cap-mb 128 --runs 5 --warmups 2 --csv mem-arena/process_mem_bench.csv
 ```
 
+Run multiple datasets sequentially in one command:
+
+```bash
+./mem-arena/process_mem_bench --dataset {repetitive,unique,mixed_50_50} --region-mb 256 --arena-cap-mb 128 --runs 5 --warmups 2 --csv mem-arena/process_mem_bench.csv
+```
+
+Equivalent quoted list form:
+
+```bash
+./mem-arena/process_mem_bench --dataset "repetitive,unique,mixed_50_50" --region-mb 256 --arena-cap-mb 128 --runs 5 --warmups 2 --csv mem-arena/process_mem_bench.csv
+```
+
 ## Integration with workloads
 
 `workloads/bin/anon_streamer` and `workloads/bin/interactive_burst` support:
