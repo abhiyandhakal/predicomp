@@ -104,3 +104,10 @@ Use `workloads/` for bounded process/memory workload generation plus wrappers fo
 `stress-ng`, `mmtests`, `phoronix-test-suite`, `sysbench`, and `fio`.
 
 See `workloads/README.md` for build/run commands, safety guardrails, and citations.
+
+## Dedicated RAM Compression Pool
+
+Use `ram-pool/` to provision a dedicated zram-backed compressed RAM space and run
+manual compression/readback triggers via workload profiles.
+
+See `ram-pool/README.md` for setup, status, trigger, and reset commands.
