@@ -4,6 +4,11 @@ LDFLAGS ?=
 
 SRC_DIR := src
 BIN_DIR := bin
+MEM_ARENA_DIR := ../mem-arena
+MEM_ARENA_SRCS := \
+	$(MEM_ARENA_DIR)/src/mem_arena.c \
+	$(MEM_ARENA_DIR)/src/mem_arena_codec.c \
+	$(MEM_ARENA_DIR)/src/mem_arena_lru.c
 
 TARGETS := \
 	fork_exit_storm \
@@ -24,7 +29,8 @@ $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 $(BIN_DIR)/%: $(SRC_DIR)/%.c $(SRC_DIR)/common.c $(SRC_DIR)/common.h | $(BIN_DIR)
-	$(CC) $(CFLAGS) $< $(SRC_DIR)/common.c -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) -I$(MEM_ARENA_DIR)/include -I$(MEM_ARENA_DIR)/src \
+		$< $(SRC_DIR)/common.c $(MEM_ARENA_SRCS) -o $@ $(LDFLAGS) -llz4
 
 smoke: all
 	./$(BIN_DIR)/fork_exit_storm --duration-sec 1 --workers 1 --fork-rate 5

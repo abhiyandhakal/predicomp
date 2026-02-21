@@ -1,5 +1,7 @@
 #include "common.h"
 
+#include <mem_arena.h>
+
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,11 +11,51 @@
 #define DEFAULT_IDLE_MS 300
 #define PAGE_SIZE 4096
 
+static int write_arena_stats_json(
+    const char *path,
+    const char *workload,
+    const struct mem_arena_stats *stats
+)
+{
+    FILE *fp;
+
+    if (path == NULL) {
+        return 0;
+    }
+
+    fp = fopen(path, "w");
+    if (fp == NULL) {
+        perror("fopen(arena_stats_json)");
+        return -1;
+    }
+
+    fprintf(fp, "{");
+    fprintf(fp, "\"workload\":\"%s\",", workload);
+    fprintf(fp, "\"logical_input_bytes\":%" PRIu64 ",", stats->logical_input_bytes);
+    fprintf(fp, "\"compressed_bytes_live\":%" PRIu64 ",", stats->compressed_bytes_live);
+    fprintf(fp, "\"slot_bytes_live\":%" PRIu64 ",", stats->slot_bytes_live);
+    fprintf(fp, "\"compress_ops\":%" PRIu64 ",", stats->compress_ops);
+    fprintf(fp, "\"decompress_ops\":%" PRIu64 ",", stats->decompress_ops);
+    fprintf(fp, "\"evictions_lru\":%" PRIu64 ",", stats->evictions_lru);
+    fprintf(fp, "\"incompressible_chunks\":%" PRIu64 ",", stats->incompressible_chunks);
+    fprintf(fp, "\"access_hits_raw\":%" PRIu64 ",", stats->access_hits_raw);
+    fprintf(fp, "\"access_hits_decompressed\":%" PRIu64 ",", stats->access_hits_decompressed);
+    fprintf(fp, "\"compression_reject_small_gain\":%" PRIu64, stats->compression_reject_small_gain);
+    fprintf(fp, "}\n");
+
+    fclose(fp);
+    return 0;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr, "usage: %s [options]\n", prog);
-    fprintf(stderr, "  --region-mb <n>  region size in MB (default %d)\n", DEFAULT_REGION_MB);
-    fprintf(stderr, "  --idle-ms <n>    sleep between passes (default %d)\n", DEFAULT_IDLE_MS);
+    fprintf(stderr, "  --region-mb <n>            region size in MB (default %d)\n", DEFAULT_REGION_MB);
+    fprintf(stderr, "  --idle-ms <n>              sleep between passes (default %d)\n", DEFAULT_IDLE_MS);
+    fprintf(stderr, "  --use-mem-arena            enable managed compression arena\n");
+    fprintf(stderr, "  --arena-cap-mb <n>         arena compressed pool MB (default 256)\n");
+    fprintf(stderr, "  --arena-min-savings-pct <n> min savings threshold %% (default 5)\n");
+    fprintf(stderr, "  --arena-stats-json <path>  write arena stats JSON\n");
     wl_print_common_help();
 }
 
@@ -22,9 +64,22 @@ int main(int argc, char **argv)
     struct wl_common_opts common;
     int region_mb = DEFAULT_REGION_MB;
     int idle_ms = DEFAULT_IDLE_MS;
+    int use_mem_arena = 0;
+    int arena_cap_mb = 256;
+    int arena_min_savings_pct = 5;
+    const char *arena_stats_json = NULL;
     uint64_t passes = 0;
+    size_t len;
+    uint64_t start_ns;
+    uint64_t deadline_ns;
+    struct mem_arena *arena = NULL;
+    int region_id = -1;
+    unsigned char *raw_buf = NULL;
+    struct mem_arena_stats arena_stats;
 
     wl_init_common_opts(&common);
+    memset(&arena_stats, 0, sizeof(arena_stats));
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
@@ -32,6 +87,10 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "--unsafe-allow-long") == 0) {
             wl_parse_common_arg(&common, argv[i], NULL);
+            continue;
+        }
+        if (strcmp(argv[i], "--use-mem-arena") == 0) {
+            use_mem_arena = 1;
             continue;
         }
         if (i + 1 >= argc) {
@@ -46,6 +105,18 @@ int main(int argc, char **argv)
             idle_ms = wl_parse_int_arg("--idle-ms", argv[++i], 1, 30000);
             continue;
         }
+        if (strcmp(argv[i], "--arena-cap-mb") == 0) {
+            arena_cap_mb = wl_parse_int_arg("--arena-cap-mb", argv[++i], 8, 65536);
+            continue;
+        }
+        if (strcmp(argv[i], "--arena-min-savings-pct") == 0) {
+            arena_min_savings_pct = wl_parse_int_arg("--arena-min-savings-pct", argv[++i], 0, 95);
+            continue;
+        }
+        if (strcmp(argv[i], "--arena-stats-json") == 0) {
+            arena_stats_json = argv[++i];
+            continue;
+        }
         if (wl_parse_common_arg(&common, argv[i], argv[i + 1])) {
             i++;
             continue;
@@ -58,26 +129,91 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    size_t len = (size_t)region_mb * 1024UL * 1024UL;
-    char *buf = malloc(len);
-    if (buf == NULL) {
-        perror("malloc");
-        return 1;
-    }
-    memset(buf, 0, len);
+    len = (size_t)region_mb * 1024UL * 1024UL;
 
-    uint64_t start_ns = wl_now_ns();
-    uint64_t deadline_ns = start_ns + (uint64_t)common.duration_sec * 1000000000ULL;
+    if (use_mem_arena) {
+        struct mem_arena_config cfg;
+
+        cfg.arena_capacity_bytes = (size_t)arena_cap_mb * 1024UL * 1024UL;
+        cfg.chunk_size = PAGE_SIZE;
+        cfg.min_savings_percent = arena_min_savings_pct;
+        cfg.lz4_acceleration = 1;
+
+        arena = mem_arena_create(&cfg);
+        if (arena == NULL) {
+            fprintf(stderr, "mem_arena_create failed\n");
+            return 1;
+        }
+        if (mem_arena_region_alloc(arena, len, "anon_streamer", &region_id, &raw_buf) != 0) {
+            fprintf(stderr, "mem_arena_region_alloc failed\n");
+            mem_arena_destroy(arena);
+            return 1;
+        }
+    } else {
+        raw_buf = malloc(len);
+        if (raw_buf == NULL) {
+            perror("malloc");
+            return 1;
+        }
+    }
+
+    memset(raw_buf, 0, len);
+
+    start_ns = wl_now_ns();
+    deadline_ns = start_ns + (uint64_t)common.duration_sec * 1000000000ULL;
+
     while (wl_now_ns() < deadline_ns) {
         for (size_t off = 0; off < len; off += PAGE_SIZE) {
-            buf[off]++;
+            if (use_mem_arena) {
+                if (mem_arena_touch(arena, region_id, off, MEM_ARENA_OP_INC) != 0) {
+                    fprintf(stderr, "mem_arena_touch failed\n");
+                    mem_arena_destroy(arena);
+                    return 1;
+                }
+            } else {
+                raw_buf[off]++;
+            }
         }
         passes++;
+
+        if (use_mem_arena) {
+            if (mem_arena_compress_region(arena, region_id) != 0) {
+                fprintf(stderr, "mem_arena_compress_region failed\n");
+                mem_arena_destroy(arena);
+                return 1;
+            }
+        }
+
         wl_sleep_ns((uint64_t)idle_ms * 1000000ULL);
+
         for (size_t off = 0; off < len; off += PAGE_SIZE) {
-            buf[off]++;
+            if (use_mem_arena) {
+                if (mem_arena_touch(arena, region_id, off, MEM_ARENA_OP_INC) != 0) {
+                    fprintf(stderr, "mem_arena_touch failed\n");
+                    mem_arena_destroy(arena);
+                    return 1;
+                }
+            } else {
+                raw_buf[off]++;
+            }
         }
         passes++;
+
+        if (use_mem_arena) {
+            if (mem_arena_compress_region(arena, region_id) != 0) {
+                fprintf(stderr, "mem_arena_compress_region failed\n");
+                mem_arena_destroy(arena);
+                return 1;
+            }
+        }
+    }
+
+    if (use_mem_arena) {
+        if (mem_arena_get_stats(arena, &arena_stats) != 0) {
+            fprintf(stderr, "mem_arena_get_stats failed\n");
+            mem_arena_destroy(arena);
+            return 1;
+        }
     }
 
     double elapsed_ms = (double)(wl_now_ns() - start_ns) / 1000000.0;
@@ -86,17 +222,42 @@ int main(int argc, char **argv)
         wl_print_json_kv_str("workload", "anon_streamer", false);
         wl_print_json_kv_u64("passes", passes, false);
         wl_print_json_kv_u64("region_mb", (uint64_t)region_mb, false);
+        wl_print_json_kv_u64("use_mem_arena", (uint64_t)use_mem_arena, false);
+        if (use_mem_arena) {
+            wl_print_json_kv_u64("arena_compress_ops", arena_stats.compress_ops, false);
+            wl_print_json_kv_u64("arena_decompress_ops", arena_stats.decompress_ops, false);
+            wl_print_json_kv_u64("arena_evictions_lru", arena_stats.evictions_lru, false);
+        }
         wl_print_json_kv_double("elapsed_ms", elapsed_ms, true);
         printf("}\n");
     } else {
-        printf("anon_streamer region_mb=%d idle_ms=%d duration_sec=%d passes=%" PRIu64 " elapsed_ms=%.3f\n",
+        printf("anon_streamer region_mb=%d idle_ms=%d duration_sec=%d passes=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d",
                region_mb,
                idle_ms,
                common.duration_sec,
                passes,
-               elapsed_ms);
+               elapsed_ms,
+               use_mem_arena);
+        if (use_mem_arena) {
+            printf(" arena_compress_ops=%" PRIu64 " arena_decompress_ops=%" PRIu64 " arena_evictions_lru=%" PRIu64,
+                   arena_stats.compress_ops,
+                   arena_stats.decompress_ops,
+                   arena_stats.evictions_lru);
+        }
+        printf("\n");
     }
 
-    free(buf);
+    if (use_mem_arena) {
+        if (arena_stats_json != NULL) {
+            if (write_arena_stats_json(arena_stats_json, "anon_streamer", &arena_stats) != 0) {
+                mem_arena_destroy(arena);
+                return 1;
+            }
+        }
+        mem_arena_destroy(arena);
+    } else {
+        free(raw_buf);
+    }
+
     return 0;
 }
