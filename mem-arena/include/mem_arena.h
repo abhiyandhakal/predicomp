@@ -19,6 +19,9 @@ struct mem_arena_config {
 };
 
 struct mem_arena_stats {
+    uint64_t total_input_bytes_attempted;
+    uint64_t total_chunks_attempted;
+    uint64_t chunks_admitted;
     uint64_t logical_input_bytes;
     uint64_t compressed_bytes_live;
     uint64_t pool_bytes_live;

@@ -90,6 +90,9 @@ Example:
 ## Stats
 
 - `logical_input_bytes`
+- `total_input_bytes_attempted`
+- `total_chunks_attempted`
+- `chunks_admitted`
 - `compressed_bytes_live`
 - `pool_bytes_live`
 - `pool_bytes_free`
@@ -106,6 +109,15 @@ Example:
 - `compression_reject_small_gain` (subset: rejected due to savings threshold)
 
 These are designed to feed your fairness model and early-decompression policy ideas.
+
+Ratio interpretation:
+
+- `ratio_overall_post_comp = total_input_bytes_attempted / pool_bytes_post_compress`
+- `ratio_admitted_post_comp = logical_input_bytes / pool_bytes_post_compress`
+- `admit_rate_post_comp = chunks_admitted / total_chunks_attempted`
+
+Use `ratio_overall_post_comp` as the primary end-to-end indicator.
+`ratio_admitted_post_comp` is a codec-efficiency diagnostic on admitted chunks only.
 
 ## Per-Process RAM + CPU + Phase/Fault Tracking
 

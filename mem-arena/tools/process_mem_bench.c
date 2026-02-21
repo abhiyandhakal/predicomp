@@ -535,6 +535,14 @@ static double msdiff(const struct timespec *a, const struct timespec *b)
     return sec * 1000.0 + nsec / 1000000.0;
 }
 
+static double safe_ratio_u64(uint64_t num, uint64_t den)
+{
+    if (den == 0) {
+        return 0.0;
+    }
+    return (double)num / (double)den;
+}
+
 static uint64_t nsdiff(const struct timespec *a, const struct timespec *b)
 {
     uint64_t sec = (uint64_t)(b->tv_sec - a->tv_sec);
@@ -1049,6 +1057,8 @@ static int write_csv_header(FILE *fp)
                    "compressed_bytes_post_compress,slot_bytes_post_compress,"
                    "pool_bytes_post_compress,pool_free_post_compress,pool_frag_post_compress,"
                    "pool_largest_free_post_compress,pool_compactions_post_compress,"
+                   "total_input_bytes_attempted,total_chunks_attempted,chunks_admitted,admit_rate_post_comp,"
+                   "ratio_overall_post_comp,ratio_admitted_post_comp,"
                    "logical_input_bytes,compressed_bytes_live,slot_bytes_live,pool_bytes_live,pool_bytes_free,"
                    "pool_bytes_fragmented,pool_largest_free_extent,pool_compactions,"
                    "compress_ops,decompress_ops,evictions_lru,"
@@ -1061,6 +1071,18 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
 {
     long long pss_delta_comp = (long long)s->pre_comp.pss_kb - (long long)s->post_comp.pss_kb;
     long long pss_delta_final = (long long)s->pre_comp.pss_kb - (long long)s->post_final.pss_kb;
+    double admit_rate = safe_ratio_u64(
+        s->arena_stats_post_comp.chunks_admitted,
+        s->arena_stats_post_comp.total_chunks_attempted
+    );
+    double ratio_overall = safe_ratio_u64(
+        s->arena_stats_post_comp.total_input_bytes_attempted,
+        s->pool_bytes_post_compress
+    );
+    double ratio_admitted = safe_ratio_u64(
+        s->arena_stats_post_comp.logical_input_bytes,
+        s->pool_bytes_post_compress
+    );
 
     if (fprintf(fp,
                 "%s,%d,%d,%d,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,",
@@ -1172,9 +1194,16 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
         return -1;
     }
     if (fprintf(fp,
+                "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.6f,%.6f,%.6f,"
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
                 "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+                s->arena_stats_post_comp.total_input_bytes_attempted,
+                s->arena_stats_post_comp.total_chunks_attempted,
+                s->arena_stats_post_comp.chunks_admitted,
+                admit_rate,
+                ratio_overall,
+                ratio_admitted,
                 s->arena_stats.logical_input_bytes,
                 s->arena_stats.compressed_bytes_live,
                 s->arena_stats.slot_bytes_live,
@@ -1198,15 +1227,27 @@ static int append_csv_row(FILE *fp, const struct options *opts, const char *data
 static void print_header(void)
 {
     printf("dataset      run warm phase_model               pss_pre_kb pss_post_comp_kb pss_post_final_kb ");
-    printf("comp_cpu_ms decomp_cpu_ms touch_p99_ns stall_p99_ns stall_events minflt majflt incompressible\n");
+    printf("ratio_overall ratio_admitted admit_rate incompressible\n");
     printf("------------ --- ---- ------------------------- ------------ ------------------ ------------------- ");
-    printf("----------- ------------- ------------ ----------- ------------ ------ ------ ------------\n");
+    printf("------------- ------------- ---------- ------------\n");
 }
 
 static void print_row(const char *dataset, const struct sample *s, const struct options *opts)
 {
-    printf("%-12s %3d %4d %-25s %12" PRIu64 " %18" PRIu64 " %19" PRIu64 " %11.3f %13.3f %12" PRIu64
-           " %11" PRIu64 " %12" PRIu64 " %6" PRIu64 " %6" PRIu64 " %12" PRIu64 "\n",
+    double ratio_overall = safe_ratio_u64(
+        s->arena_stats_post_comp.total_input_bytes_attempted,
+        s->pool_bytes_post_compress
+    );
+    double ratio_admitted = safe_ratio_u64(
+        s->arena_stats_post_comp.logical_input_bytes,
+        s->pool_bytes_post_compress
+    );
+    double admit_rate = safe_ratio_u64(
+        s->arena_stats_post_comp.chunks_admitted,
+        s->arena_stats_post_comp.total_chunks_attempted
+    );
+
+    printf("%-12s %3d %4d %-25s %12" PRIu64 " %18" PRIu64 " %19" PRIu64 " %13.3f %13.3f %10.3f %12" PRIu64 "\n",
            dataset,
            s->run_id,
            s->warmup,
@@ -1214,13 +1255,9 @@ static void print_row(const char *dataset, const struct sample *s, const struct 
            s->pre_comp.pss_kb,
            s->post_comp.pss_kb,
            s->post_final.pss_kb,
-           s->compress_thread_cpu_ms,
-           s->decompress_thread_cpu_ms,
-           s->combined_latency.p99_ns,
-           s->stall_latency.p99_ns,
-           s->stall_events_total,
-           s->minflt_delta,
-           s->majflt_delta,
+           ratio_overall,
+           ratio_admitted,
+           admit_rate,
            s->arena_stats.incompressible_chunks);
 }
 

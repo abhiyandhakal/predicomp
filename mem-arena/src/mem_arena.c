@@ -446,6 +446,9 @@ static int compress_chunk(struct mem_arena *arena, int region_id, size_t chunk_i
         return 0;
     }
 
+    arena->stats.total_chunks_attempted++;
+    arena->stats.total_input_bytes_attempted += (uint64_t)arena->cfg.chunk_size;
+
     src = region->raw + (chunk_idx * arena->cfg.chunk_size);
     tmp = malloc(arena->cfg.chunk_size + 128U);
     if (tmp == NULL) {
@@ -514,6 +517,7 @@ static int compress_chunk(struct mem_arena *arena, int region_id, size_t chunk_i
     chunk->comp_len = out_size;
     chunk->tick = ++arena->tick;
 
+    arena->stats.chunks_admitted++;
     arena->stats.compress_ops++;
     arena->stats.logical_input_bytes += (uint64_t)arena->cfg.chunk_size;
     arena->stats.compressed_bytes_live += (uint64_t)out_size;
