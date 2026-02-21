@@ -45,6 +45,13 @@ Run demo:
 make -C mem-arena demo
 ```
 
+Run per-process RAM benchmark:
+
+```bash
+make -C mem-arena bench
+./mem-arena/process_mem_bench --dataset repetitive --region-mb 256 --arena-cap-mb 128 --runs 5 --warmups 2 --csv mem-arena/process_mem_bench.csv
+```
+
 ## Integration with workloads
 
 `workloads/bin/anon_streamer` and `workloads/bin/interactive_burst` support:
@@ -81,6 +88,25 @@ Example:
 - `compression_reject_small_gain`
 
 These are designed to feed your fairness model and early-decompression policy ideas.
+
+## Per-Process RAM + CPU Tracking
+
+`process_mem_bench` measures, per run:
+
+- `VmRSS` before compression (`rss_pre_kb`)
+- `VmRSS` after compression (`rss_post_compress_kb`)
+- `VmRSS` after readback/decompression (`rss_post_readback_kb`)
+- `VmHWM` (`vmhwm_kb`)
+- compression/decompression CPU and wall time:
+  - `compress_thread_cpu_ms`, `compress_process_cpu_ms`, `compress_wall_ms`
+  - `decompress_thread_cpu_ms`, `decompress_process_cpu_ms`, `decompress_wall_ms`
+
+It writes:
+
+- terminal table for quick review
+- CSV for analysis/plotting (`--csv`)
+
+The measured process is the benchmark process itself (managed test process path).
 
 ## Limitations
 

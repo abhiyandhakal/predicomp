@@ -119,3 +119,5 @@ swap ingress. This is useful for controlled experiments with explicit compressio
 and decompression triggers inside workload binaries.
 
 See `mem-arena/README.md` for API/build details and workload integration.
+For per-process RAM before/after compression and compressor CPU cost, run
+`./mem-arena/process_mem_bench` (or `make mem-arena-bench`).

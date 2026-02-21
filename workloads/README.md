@@ -131,6 +131,8 @@ Examples:
 ```
 
 See `mem-arena/README.md` for arena architecture and metric definitions.
+For formal per-process RAM before/after compression + compressor CPU accounting,
+use `mem-arena/process_mem_bench`.
 
 ## Safety model (strict by default)
 
