@@ -118,6 +118,8 @@ Ratio interpretation:
 
 Use `ratio_overall_post_comp` as the primary end-to-end indicator.
 `ratio_admitted_post_comp` is a codec-efficiency diagnostic on admitted chunks only.
+Because `ratio_overall_post_comp` includes rejected/incompressible attempts in the numerator,
+it can be higher than `ratio_admitted_post_comp` when admit rate is below 1.0 (for example, mixed datasets).
 
 ## Per-Process RAM + CPU + Phase/Fault Tracking
 
