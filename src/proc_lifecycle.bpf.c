@@ -11,7 +11,7 @@ struct {
     __uint(max_entries, 1 << 20);
 } events SEC(".maps");
 
-static __always_inline int submit_event(uint32_t type, uint32_t pid_hint, const char *comm_hint)
+static __always_inline struct proc_lifecycle_event *reserve_event(uint32_t type, uint32_t pid_hint)
 {
     struct proc_lifecycle_event *event;
     uint64_t pid_tgid;
@@ -24,7 +24,7 @@ static __always_inline int submit_event(uint32_t type, uint32_t pid_hint, const 
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (event == NULL) {
-        return 0;
+        return NULL;
     }
 
     __builtin_memset(event, 0, sizeof(*event));
@@ -33,25 +33,35 @@ static __always_inline int submit_event(uint32_t type, uint32_t pid_hint, const 
     event->tgid = tgid;
     event->ppid = 0;
     event->ktime_ns = bpf_ktime_get_ns();
-
-    if (comm_hint != NULL) {
-        __builtin_memcpy(event->comm, comm_hint, sizeof(event->comm));
-    } else {
-        bpf_get_current_comm(&event->comm, sizeof(event->comm));
-    }
-
-    bpf_ringbuf_submit(event, 0);
-    return 0;
+    return event;
 }
 
 SEC("tracepoint/sched/sched_process_exec")
 int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
-    return submit_event(PROC_LIFECYCLE_EVENT_EXEC, (uint32_t)ctx->pid, NULL);
+    struct proc_lifecycle_event *event;
+
+    event = reserve_event(PROC_LIFECYCLE_EVENT_EXEC, (uint32_t)ctx->pid);
+    if (event == NULL) {
+        return 0;
+    }
+
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    bpf_ringbuf_submit(event, 0);
+    return 0;
 }
 
 SEC("tracepoint/sched/sched_process_exit")
 int handle_sched_process_exit(struct trace_event_raw_sched_process_exit *ctx)
 {
-    return submit_event(PROC_LIFECYCLE_EVENT_EXIT, (uint32_t)ctx->pid, ctx->comm);
+    struct proc_lifecycle_event *event;
+
+    event = reserve_event(PROC_LIFECYCLE_EVENT_EXIT, (uint32_t)ctx->pid);
+    if (event == NULL) {
+        return 0;
+    }
+
+    __builtin_memcpy(event->comm, ctx->comm, sizeof(event->comm));
+    bpf_ringbuf_submit(event, 0);
+    return 0;
 }
