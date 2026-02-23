@@ -9,7 +9,7 @@ BPF_CFLAGS += -O2 -g -target bpf -D__TARGET_ARCH_x86
 
 .PHONY: all clean run run-page-fault run-swap-probe run-proc-lifecycle workloads workloads-smoke ram-pool-status mem-arena mem-arena-demo mem-arena-bench controller
 
-all: proc_create page_fault swap_probe proc_lifecycle workload_controller
+all: proc_create page_fault swap_probe proc_lifecycle workload_controller workloads mem-arena
 
 vmlinux.h:
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
@@ -52,6 +52,8 @@ proc_lifecycle: src/proc_lifecycle.skel.h
 
 workload_controller: controller/workload_controller.c src/proc_lifecycle.skel.h controller/workload_control_protocol.h src/proc_lifecycle_event.h
 	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) -I./src -I./controller $< -o $@ $(LIBBPF_LIBS) -lelf -lz
+
+controller: workload_controller
 
 run: proc_create
 	sudo ./proc_create
