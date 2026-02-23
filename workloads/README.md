@@ -111,10 +111,12 @@ All binaries support strict defaults and common flags:
 
 ## Optional swap-free mem-arena mode
 
-Two workloads support direct integration with `mem-arena`:
+Memory-like workloads that support direct integration with `mem-arena` and controller-triggered compression:
 
 - `bin/anon_streamer`
 - `bin/interactive_burst`
+- `bin/random_touch_heap`
+- `bin/mmap_churn` (hybrid mode: real mmap churn + sidecar mem-arena compression target)
 
 Shared flags:
 
@@ -123,7 +125,7 @@ Shared flags:
 - `--arena-min-savings-pct <n>`
 - `--arena-stats-json <path>`
 
-External controller integration flags (for `anon_streamer`, `interactive_burst`):
+External controller integration flags (for the mem-arena-enabled workloads above):
 
 - `--controller-enroll` (requires `--use-mem-arena`)
 - `--controller-sock <path>` (default `/tmp/predicomp-controller.sock`)
@@ -134,6 +136,8 @@ Examples:
 ```bash
 ./workloads/bin/anon_streamer --duration-sec 30 --region-mb 512 --use-mem-arena --arena-cap-mb 256 --arena-stats-json /tmp/anon_arena.json
 ./workloads/bin/interactive_burst --duration-sec 30 --region-mb 256 --active-ms 100 --idle-ms 400 --use-mem-arena --arena-cap-mb 128 --arena-stats-json /tmp/burst_arena.json
+./workloads/bin/random_touch_heap --duration-sec 30 --region-mb 512 --ops-per-sec 400000 --use-mem-arena --arena-cap-mb 256
+./workloads/bin/mmap_churn --duration-sec 30 --map-kb 512 --ops-per-sec 500 --use-mem-arena --arena-region-mb 128 --arena-cap-mb 128
 ```
 
 Controller-driven external compression example (10s policy is configured in the controller, not the workload):
@@ -154,6 +158,35 @@ See `mem-arena/README.md` for arena architecture and metric definitions.
 For formal per-process RAM before/after compression + compressor CPU accounting,
 use `mem-arena/process_mem_bench`.
 See `controller/README.md` for the lifecycle probe + PID tracking controller details.
+
+## Controller Matrix Runner (All Workloads)
+
+Run the full workload suite against a fresh controller instance per workload:
+
+```bash
+sudo ./workloads/scripts/run_controller_workload_matrix.sh --delay-sec 10 --duration-sec 20
+```
+
+Per-workload outputs are written under `workloads/results/controller-matrix/<timestamp>/`:
+
+- `controller.log`
+- `controller.csv`
+- `workload.stdout`
+- `summary.json`
+
+### Two-Tier Coverage
+
+- Triggerable (controller-driven compression):
+  - `anon_streamer`
+  - `interactive_burst`
+  - `random_touch_heap`
+  - `mmap_churn` (sidecar mem-arena)
+- Observe-only (signal/lineage coverage under fixed `exec + 10s` policy):
+  - `fork_exit_storm`
+  - `fork_touch_exit`
+  - `fork_exec_storm`
+
+Observe-only workloads are expected to show controller lifecycle rows but be classified as ineligible/skipped for compression efficacy.
 
 ## Safety model (strict by default)
 

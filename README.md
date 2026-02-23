@@ -111,8 +111,8 @@ See `workloads/README.md` for build/run commands, safety guardrails, and citatio
 
 Use `./workload_controller` plus `proc_lifecycle` eBPF events to:
 
-- track process `exec`/`exit` in userspace
-- enroll mem-arena workloads (`anon_streamer`, `interactive_burst`)
+- track process `exec`/`exit`/`fork` in userspace
+- enroll mem-arena workloads (`anon_streamer`, `interactive_burst`, `random_touch_heap`, `mmap_churn`)
 - send `SIGUSR1` at `exec + N seconds` (default 10s)
 - collect compression ACKs + mem-arena stats snapshots over a Unix datagram socket
 
@@ -130,6 +130,8 @@ Then run a mem-arena workload with external policy:
 ```
 
 See `controller/README.md` for the full runbook and CSV fields.
+To run the entire workload suite with isolated per-workload controller outputs, use:
+`sudo ./workloads/scripts/run_controller_workload_matrix.sh`.
 
 ## Dedicated RAM Compression Pool
 
