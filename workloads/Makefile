@@ -28,9 +28,9 @@ all: $(BINS)
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
-$(BIN_DIR)/%: $(SRC_DIR)/%.c $(SRC_DIR)/common.c $(SRC_DIR)/common.h | $(BIN_DIR)
+$(BIN_DIR)/%: $(SRC_DIR)/%.c $(SRC_DIR)/common.c $(SRC_DIR)/common.h $(SRC_DIR)/controller_client.c $(SRC_DIR)/controller_client.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) -I$(MEM_ARENA_DIR)/include -I$(MEM_ARENA_DIR)/src -I../controller \
-		$< $(SRC_DIR)/common.c $(MEM_ARENA_SRCS) -o $@ $(LDFLAGS) -llz4
+		$< $(SRC_DIR)/common.c $(SRC_DIR)/controller_client.c $(MEM_ARENA_SRCS) -o $@ $(LDFLAGS) -llz4
 
 smoke: all
 	./$(BIN_DIR)/fork_exit_storm --duration-sec 1 --workers 1 --fork-rate 5
