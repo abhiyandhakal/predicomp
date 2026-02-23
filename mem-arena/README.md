@@ -112,14 +112,14 @@ These are designed to feed your fairness model and early-decompression policy id
 
 Ratio interpretation:
 
-- `ratio_overall_post_comp = total_input_bytes_attempted / pool_bytes_post_compress`
-- `ratio_admitted_post_comp = logical_input_bytes / pool_bytes_post_compress`
+- `ratio_e2e_post_comp = total_input_bytes_attempted / ((total_input_bytes_attempted - logical_input_bytes) + pool_used_bytes_post_comp)`
+- `ratio_admitted_post_comp = logical_input_bytes / pool_used_bytes_post_comp`
+- `ratio_codec_post_comp = logical_input_bytes / compressed_bytes_post_comp`
 - `admit_rate_post_comp = chunks_admitted / total_chunks_attempted`
 
-Use `ratio_overall_post_comp` as the primary end-to-end indicator.
+Use `ratio_e2e_post_comp` as the primary end-to-end indicator.
 `ratio_admitted_post_comp` is a codec-efficiency diagnostic on admitted chunks only.
-Because `ratio_overall_post_comp` includes rejected/incompressible attempts in the numerator,
-it can be higher than `ratio_admitted_post_comp` when admit rate is below 1.0 (for example, mixed datasets).
+`ratio_codec_post_comp` isolates codec efficiency from pool allocator overhead.
 
 ## Per-Process RAM + CPU + Phase/Fault Tracking
 

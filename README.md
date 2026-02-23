@@ -121,5 +121,5 @@ and decompression triggers inside workload binaries.
 See `mem-arena/README.md` for API/build details and workload integration.
 For per-process RAM before/after compression and compressor CPU cost, run
 `./mem-arena/process_mem_bench` (or `make mem-arena-bench`).
-The benchmark now reports both `ratio_overall_post_comp` (primary) and
-`ratio_admitted_post_comp` (diagnostic), plus `admit_rate_post_comp`.
+The benchmark reports `ratio_e2e_post_comp` (primary), `ratio_admitted_post_comp`,
+`ratio_codec_post_comp`, and `admit_rate_post_comp`.
