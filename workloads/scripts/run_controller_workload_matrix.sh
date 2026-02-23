@@ -257,13 +257,17 @@ for workload in "${ALL_WORKLOADS[@]}"; do
 
     declare -a workload_cmd
     build_workload_cmd "$workload" workload_cmd
-    workload_cmd+=("--controller-sock" "$controller_sock")
+    if is_triggerable_workload "$workload"; then
+        workload_cmd+=("--controller-sock" "$controller_sock")
+    fi
 
     echo "[run] workload $workload" | tee -a "$results_dir/runner.log"
     "${workload_cmd[@]}" >"$workload_stdout" 2>&1 &
     workload_pid=$!
+    set +e
     wait "$workload_pid"
     workload_rc=$?
+    set -e
 
     kill -INT "$controller_pid" 2>/dev/null || true
     wait "$controller_pid" || true
