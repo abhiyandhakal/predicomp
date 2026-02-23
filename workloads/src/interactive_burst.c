@@ -1,17 +1,13 @@
 #include "common.h"
+#include "controller_client.h"
 
 #include <mem_arena.h>
-#include <workload_control_protocol.h>
 
-#include <errno.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
 
 #define DEFAULT_REGION_MB 128
 #define DEFAULT_ACTIVE_MS 100
@@ -59,99 +55,6 @@ static enum compress_policy parse_compress_policy(const char *value)
     exit(2);
 }
 
-static int controller_send_datagram(const char *sock_path, const void *buf, size_t len)
-{
-    int fd;
-    struct sockaddr_un addr;
-    ssize_t sent;
-
-    if (sock_path == NULL) {
-        return 0;
-    }
-
-    fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        perror("socket(controller)");
-        return -1;
-    }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    if (strlen(sock_path) >= sizeof(addr.sun_path)) {
-        fprintf(stderr, "controller socket path too long: %s\n", sock_path);
-        close(fd);
-        return -1;
-    }
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
-
-    sent = sendto(fd, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr));
-    if (sent < 0) {
-        fprintf(stderr, "sendto(controller) failed: %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    }
-    if ((size_t)sent != len) {
-        fprintf(stderr, "short sendto(controller): %zd/%zu\n", sent, len);
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    return 0;
-}
-
-static int controller_send_enroll(
-    const char *sock_path,
-    const char *workload_name,
-    int arena_cap_mb,
-    int arena_min_savings_pct,
-    int region_mb
-)
-{
-    struct wl_controller_msg_enroll msg;
-
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_type = WL_CTL_MSG_ENROLL;
-    msg.pid = (uint32_t)getpid();
-    msg.use_mem_arena = 1;
-    msg.arena_cap_mb = (uint32_t)arena_cap_mb;
-    msg.arena_min_savings_pct = (uint32_t)arena_min_savings_pct;
-    msg.region_mb = (uint32_t)region_mb;
-    strncpy(msg.workload_name, workload_name, sizeof(msg.workload_name) - 1);
-
-    return controller_send_datagram(sock_path, &msg, sizeof(msg));
-}
-
-static int controller_send_compress_ack(
-    const char *sock_path,
-    const char *workload_name,
-    uint64_t trigger_count,
-    const struct mem_arena_stats *stats
-)
-{
-    struct wl_controller_msg_compress_ack msg;
-
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_type = WL_CTL_MSG_COMPRESS_ACK;
-    msg.pid = (uint32_t)getpid();
-    msg.event_ns = wl_now_ns();
-    msg.trigger_count = trigger_count;
-    strncpy(msg.workload_name, workload_name, sizeof(msg.workload_name) - 1);
-    msg.total_input_bytes_attempted = stats->total_input_bytes_attempted;
-    msg.chunks_admitted = stats->chunks_admitted;
-    msg.logical_input_bytes = stats->logical_input_bytes;
-    msg.compressed_bytes_live = stats->compressed_bytes_live;
-    msg.pool_bytes_live = stats->pool_bytes_live;
-    msg.pool_bytes_free = stats->pool_bytes_free;
-    msg.pool_compactions = stats->pool_compactions;
-    msg.compress_ops = stats->compress_ops;
-    msg.decompress_ops = stats->decompress_ops;
-    msg.evictions_lru = stats->evictions_lru;
-    msg.incompressible_chunks = stats->incompressible_chunks;
-
-    return controller_send_datagram(sock_path, &msg, sizeof(msg));
-}
-
 static int maybe_external_compress(
     struct mem_arena *arena,
     int region_id,
@@ -176,7 +79,13 @@ static int maybe_external_compress(
 
     (*trigger_count)++;
     if (controller_sock != NULL) {
-        (void)controller_send_compress_ack(controller_sock, "interactive_burst", *trigger_count, &stats);
+        (void)wl_controller_send_compress_ack(
+            controller_sock,
+            "interactive_burst",
+            *trigger_count,
+            &stats,
+            wl_now_ns()
+        );
     }
 
     return 0;
@@ -334,8 +243,8 @@ int main(int argc, char **argv)
         return 2;
     }
     if (controller_sock == NULL) {
-        controller_sock = WL_CONTROLLER_SOCK_DEFAULT;
     }
+    controller_sock = wl_controller_sock_default_if_null(controller_sock);
 
     signal(SIGUSR1, on_sigusr1);
 
@@ -360,11 +269,11 @@ int main(int argc, char **argv)
             return 1;
         }
         if (controller_enroll) {
-            if (controller_send_enroll(controller_sock,
-                                       "interactive_burst",
-                                       arena_cap_mb,
-                                       arena_min_savings_pct,
-                                       region_mb) != 0) {
+            if (wl_controller_send_enroll(controller_sock,
+                                          "interactive_burst",
+                                          arena_cap_mb,
+                                          arena_min_savings_pct,
+                                          region_mb) != 0) {
                 mem_arena_destroy(arena);
                 return 1;
             }
