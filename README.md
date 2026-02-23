@@ -5,9 +5,11 @@ This repository currently contains two small eBPF programs:
 - `proc_create`: prints `hello world <PID>` on process fork
 - `page_fault`: prints page fault events with PID, command name, user/kernel type, fault address, and instruction pointer
 - `swap_probe`: prints 1s swap/reclaim pressure deltas from `vmscan` tracepoints
+- `proc_lifecycle` (used by `workload_controller`): emits process `exec`/`exit` events over a ring buffer for userspace control logic
 
 `proc_create` and `page_fault` use `bpf_printk`, so output is read from `trace_pipe`.
-`swap_probe` prints periodic summaries to stdout.
+`swap_probe` prints periodic summaries to stdout. `workload_controller` consumes
+`proc_lifecycle` events directly via libbpf ring buffer (no `trace_pipe`).
 
 ## Compression Fairness Policy
 
@@ -104,6 +106,30 @@ Use `workloads/` for bounded process/memory workload generation plus wrappers fo
 `stress-ng`, `mmtests`, `phoronix-test-suite`, `sysbench`, and `fio`.
 
 See `workloads/README.md` for build/run commands, safety guardrails, and citations.
+
+## 10s Post-Exec Compression Controller (Research Prototype)
+
+Use `./workload_controller` plus `proc_lifecycle` eBPF events to:
+
+- track process `exec`/`exit` in userspace
+- enroll mem-arena workloads (`anon_streamer`, `interactive_burst`)
+- send `SIGUSR1` at `exec + N seconds` (default 10s)
+- collect compression ACKs + mem-arena stats snapshots over a Unix datagram socket
+
+Build and run:
+
+```bash
+make proc_lifecycle workload_controller
+sudo ./workload_controller --delay-sec 10 --csv /tmp/workload_controller.csv
+```
+
+Then run a mem-arena workload with external policy:
+
+```bash
+./workloads/bin/anon_streamer --duration-sec 30 --region-mb 512 --use-mem-arena --controller-enroll --compress-policy external
+```
+
+See `controller/README.md` for the full runbook and CSV fields.
 
 ## Dedicated RAM Compression Pool
 

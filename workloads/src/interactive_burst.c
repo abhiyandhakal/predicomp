@@ -1,16 +1,186 @@
 #include "common.h"
 
 #include <mem_arena.h>
+#include <workload_control_protocol.h>
 
+#include <errno.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #define DEFAULT_REGION_MB 128
 #define DEFAULT_ACTIVE_MS 100
 #define DEFAULT_IDLE_MS 400
 #define PAGE_SIZE 4096
+
+enum compress_policy {
+    COMPRESS_POLICY_INTERNAL = 0,
+    COMPRESS_POLICY_EXTERNAL = 1,
+    COMPRESS_POLICY_BOTH = 2,
+};
+
+static volatile sig_atomic_t g_compress_requested;
+
+static void on_sigusr1(int sig)
+{
+    (void)sig;
+    g_compress_requested = 1;
+}
+
+static const char *compress_policy_name(enum compress_policy policy)
+{
+    if (policy == COMPRESS_POLICY_EXTERNAL) {
+        return "external";
+    }
+    if (policy == COMPRESS_POLICY_BOTH) {
+        return "both";
+    }
+    return "internal";
+}
+
+static enum compress_policy parse_compress_policy(const char *value)
+{
+    if (strcmp(value, "internal") == 0) {
+        return COMPRESS_POLICY_INTERNAL;
+    }
+    if (strcmp(value, "external") == 0) {
+        return COMPRESS_POLICY_EXTERNAL;
+    }
+    if (strcmp(value, "both") == 0) {
+        return COMPRESS_POLICY_BOTH;
+    }
+
+    fprintf(stderr, "invalid --compress-policy: %s (expected internal|external|both)\n", value);
+    exit(2);
+}
+
+static int controller_send_datagram(const char *sock_path, const void *buf, size_t len)
+{
+    int fd;
+    struct sockaddr_un addr;
+    ssize_t sent;
+
+    if (sock_path == NULL) {
+        return 0;
+    }
+
+    fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        perror("socket(controller)");
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(sock_path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "controller socket path too long: %s\n", sock_path);
+        close(fd);
+        return -1;
+    }
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+
+    sent = sendto(fd, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr));
+    if (sent < 0) {
+        fprintf(stderr, "sendto(controller) failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if ((size_t)sent != len) {
+        fprintf(stderr, "short sendto(controller): %zd/%zu\n", sent, len);
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    return 0;
+}
+
+static int controller_send_enroll(
+    const char *sock_path,
+    const char *workload_name,
+    int arena_cap_mb,
+    int arena_min_savings_pct,
+    int region_mb
+)
+{
+    struct wl_controller_msg_enroll msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = WL_CTL_MSG_ENROLL;
+    msg.pid = (uint32_t)getpid();
+    msg.use_mem_arena = 1;
+    msg.arena_cap_mb = (uint32_t)arena_cap_mb;
+    msg.arena_min_savings_pct = (uint32_t)arena_min_savings_pct;
+    msg.region_mb = (uint32_t)region_mb;
+    strncpy(msg.workload_name, workload_name, sizeof(msg.workload_name) - 1);
+
+    return controller_send_datagram(sock_path, &msg, sizeof(msg));
+}
+
+static int controller_send_compress_ack(
+    const char *sock_path,
+    const char *workload_name,
+    uint64_t trigger_count,
+    const struct mem_arena_stats *stats
+)
+{
+    struct wl_controller_msg_compress_ack msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = WL_CTL_MSG_COMPRESS_ACK;
+    msg.pid = (uint32_t)getpid();
+    msg.event_ns = wl_now_ns();
+    msg.trigger_count = trigger_count;
+    strncpy(msg.workload_name, workload_name, sizeof(msg.workload_name) - 1);
+    msg.total_input_bytes_attempted = stats->total_input_bytes_attempted;
+    msg.chunks_admitted = stats->chunks_admitted;
+    msg.logical_input_bytes = stats->logical_input_bytes;
+    msg.compressed_bytes_live = stats->compressed_bytes_live;
+    msg.pool_bytes_live = stats->pool_bytes_live;
+    msg.pool_bytes_free = stats->pool_bytes_free;
+    msg.pool_compactions = stats->pool_compactions;
+    msg.compress_ops = stats->compress_ops;
+    msg.decompress_ops = stats->decompress_ops;
+    msg.evictions_lru = stats->evictions_lru;
+    msg.incompressible_chunks = stats->incompressible_chunks;
+
+    return controller_send_datagram(sock_path, &msg, sizeof(msg));
+}
+
+static int maybe_external_compress(
+    struct mem_arena *arena,
+    int region_id,
+    const char *controller_sock,
+    uint64_t *trigger_count
+)
+{
+    struct mem_arena_stats stats;
+
+    if (!g_compress_requested) {
+        return 0;
+    }
+
+    g_compress_requested = 0;
+    if (mem_arena_compress_region(arena, region_id) != 0) {
+        return -1;
+    }
+    memset(&stats, 0, sizeof(stats));
+    if (mem_arena_get_stats(arena, &stats) != 0) {
+        return -1;
+    }
+
+    (*trigger_count)++;
+    if (controller_sock != NULL) {
+        (void)controller_send_compress_ack(controller_sock, "interactive_burst", *trigger_count, &stats);
+    }
+
+    return 0;
+}
 
 static int write_arena_stats_json(
     const char *path,
@@ -58,6 +228,9 @@ static void usage(const char *prog)
     fprintf(stderr, "  --arena-cap-mb <n>         arena compressed pool MB (default 256)\n");
     fprintf(stderr, "  --arena-min-savings-pct <n> min savings threshold %% (default 5)\n");
     fprintf(stderr, "  --arena-stats-json <path>  write arena stats JSON\n");
+    fprintf(stderr, "  --controller-enroll        enroll with workload controller (requires mem-arena)\n");
+    fprintf(stderr, "  --controller-sock <path>   controller unix datagram socket path\n");
+    fprintf(stderr, "  --compress-policy <mode>   internal|external|both (default internal)\n");
     wl_print_common_help();
 }
 
@@ -71,6 +244,10 @@ int main(int argc, char **argv)
     int arena_cap_mb = 256;
     int arena_min_savings_pct = 5;
     const char *arena_stats_json = NULL;
+    int controller_enroll = 0;
+    const char *controller_sock = NULL;
+    enum compress_policy compress_policy = COMPRESS_POLICY_INTERNAL;
+    uint64_t external_compress_triggers = 0;
     uint64_t touches = 0;
     size_t len;
     uint64_t start_ns;
@@ -94,6 +271,10 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--use-mem-arena") == 0) {
             use_mem_arena = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--controller-enroll") == 0) {
+            controller_enroll = 1;
             continue;
         }
         if (i + 1 >= argc) {
@@ -124,6 +305,14 @@ int main(int argc, char **argv)
             arena_stats_json = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "--controller-sock") == 0) {
+            controller_sock = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--compress-policy") == 0) {
+            compress_policy = parse_compress_policy(argv[++i]);
+            continue;
+        }
         if (wl_parse_common_arg(&common, argv[i], argv[i + 1])) {
             i++;
             continue;
@@ -135,6 +324,20 @@ int main(int argc, char **argv)
     if (wl_validate_common_opts(&common) != 0) {
         return 2;
     }
+    if (controller_enroll && !use_mem_arena) {
+        fprintf(stderr, "--controller-enroll requires --use-mem-arena\n");
+        return 2;
+    }
+    if (compress_policy != COMPRESS_POLICY_INTERNAL && !use_mem_arena) {
+        fprintf(stderr, "--compress-policy %s requires --use-mem-arena\n",
+                compress_policy_name(compress_policy));
+        return 2;
+    }
+    if (controller_sock == NULL) {
+        controller_sock = WL_CONTROLLER_SOCK_DEFAULT;
+    }
+
+    signal(SIGUSR1, on_sigusr1);
 
     len = (size_t)region_mb * 1024UL * 1024UL;
 
@@ -155,6 +358,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "mem_arena_region_alloc failed\n");
             mem_arena_destroy(arena);
             return 1;
+        }
+        if (controller_enroll) {
+            if (controller_send_enroll(controller_sock,
+                                       "interactive_burst",
+                                       arena_cap_mb,
+                                       arena_min_savings_pct,
+                                       region_mb) != 0) {
+                mem_arena_destroy(arena);
+                return 1;
+            }
         }
     } else {
         raw_buf = malloc(len);
@@ -184,9 +397,19 @@ int main(int argc, char **argv)
                 }
                 touches++;
             }
+
+            if (use_mem_arena && maybe_external_compress(arena,
+                                                         region_id,
+                                                         controller_enroll ? controller_sock : NULL,
+                                                         &external_compress_triggers) != 0) {
+                fprintf(stderr, "external mem_arena_compress_region failed\n");
+                mem_arena_destroy(arena);
+                return 1;
+            }
         }
 
-        if (use_mem_arena) {
+        if (use_mem_arena &&
+            (compress_policy == COMPRESS_POLICY_INTERNAL || compress_policy == COMPRESS_POLICY_BOTH)) {
             if (mem_arena_compress_region(arena, region_id) != 0) {
                 fprintf(stderr, "mem_arena_compress_region failed\n");
                 mem_arena_destroy(arena);
@@ -194,7 +417,34 @@ int main(int argc, char **argv)
             }
         }
 
+        if (use_mem_arena && maybe_external_compress(arena,
+                                                     region_id,
+                                                     controller_enroll ? controller_sock : NULL,
+                                                     &external_compress_triggers) != 0) {
+            fprintf(stderr, "external mem_arena_compress_region failed\n");
+            mem_arena_destroy(arena);
+            return 1;
+        }
+
         wl_sleep_ns((uint64_t)idle_ms * 1000000ULL);
+
+        if (use_mem_arena && maybe_external_compress(arena,
+                                                     region_id,
+                                                     controller_enroll ? controller_sock : NULL,
+                                                     &external_compress_triggers) != 0) {
+            fprintf(stderr, "external mem_arena_compress_region failed\n");
+            mem_arena_destroy(arena);
+            return 1;
+        }
+    }
+
+    if (use_mem_arena && maybe_external_compress(arena,
+                                                 region_id,
+                                                 controller_enroll ? controller_sock : NULL,
+                                                 &external_compress_triggers) != 0) {
+        fprintf(stderr, "external mem_arena_compress_region failed\n");
+        mem_arena_destroy(arena);
+        return 1;
     }
 
     if (use_mem_arena) {
@@ -212,6 +462,8 @@ int main(int argc, char **argv)
         wl_print_json_kv_u64("touches", touches, false);
         wl_print_json_kv_u64("region_mb", (uint64_t)region_mb, false);
         wl_print_json_kv_u64("use_mem_arena", (uint64_t)use_mem_arena, false);
+        wl_print_json_kv_str("compress_policy", compress_policy_name(compress_policy), false);
+        wl_print_json_kv_u64("external_compress_triggers", external_compress_triggers, false);
         if (use_mem_arena) {
             wl_print_json_kv_u64("arena_compress_ops", arena_stats.compress_ops, false);
             wl_print_json_kv_u64("arena_decompress_ops", arena_stats.decompress_ops, false);
@@ -220,14 +472,16 @@ int main(int argc, char **argv)
         wl_print_json_kv_double("elapsed_ms", elapsed_ms, true);
         printf("}\n");
     } else {
-        printf("interactive_burst region_mb=%d active_ms=%d idle_ms=%d duration_sec=%d touches=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d",
+        printf("interactive_burst region_mb=%d active_ms=%d idle_ms=%d duration_sec=%d touches=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d compress_policy=%s external_compress_triggers=%" PRIu64,
                region_mb,
                active_ms,
                idle_ms,
                common.duration_sec,
                touches,
                elapsed_ms,
-               use_mem_arena);
+               use_mem_arena,
+               compress_policy_name(compress_policy),
+               external_compress_triggers);
         if (use_mem_arena) {
             printf(" arena_compress_ops=%" PRIu64 " arena_decompress_ops=%" PRIu64 " arena_evictions_lru=%" PRIu64,
                    arena_stats.compress_ops,

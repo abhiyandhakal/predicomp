@@ -123,6 +123,12 @@ Shared flags:
 - `--arena-min-savings-pct <n>`
 - `--arena-stats-json <path>`
 
+External controller integration flags (for `anon_streamer`, `interactive_burst`):
+
+- `--controller-enroll` (requires `--use-mem-arena`)
+- `--controller-sock <path>` (default `/tmp/predicomp-controller.sock`)
+- `--compress-policy internal|external|both` (default `internal`)
+
 Examples:
 
 ```bash
@@ -130,9 +136,24 @@ Examples:
 ./workloads/bin/interactive_burst --duration-sec 30 --region-mb 256 --active-ms 100 --idle-ms 400 --use-mem-arena --arena-cap-mb 128 --arena-stats-json /tmp/burst_arena.json
 ```
 
+Controller-driven external compression example (10s policy is configured in the controller, not the workload):
+
+```bash
+sudo ./workload_controller --delay-sec 10 --csv /tmp/workload_controller.csv
+
+./workloads/bin/anon_streamer \
+  --duration-sec 30 \
+  --region-mb 512 \
+  --use-mem-arena \
+  --arena-cap-mb 256 \
+  --controller-enroll \
+  --compress-policy external
+```
+
 See `mem-arena/README.md` for arena architecture and metric definitions.
 For formal per-process RAM before/after compression + compressor CPU accounting,
 use `mem-arena/process_mem_bench`.
+See `controller/README.md` for the lifecycle probe + PID tracking controller details.
 
 ## Safety model (strict by default)
 

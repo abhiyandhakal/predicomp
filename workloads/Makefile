@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -g -Wall -Wextra -D_POSIX_C_SOURCE=200809L
+CFLAGS ?= -O2 -g -Wall -Wextra -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 LDFLAGS ?=
 
 SRC_DIR := src
@@ -29,7 +29,7 @@ $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 $(BIN_DIR)/%: $(SRC_DIR)/%.c $(SRC_DIR)/common.c $(SRC_DIR)/common.h | $(BIN_DIR)
-	$(CC) $(CFLAGS) -I$(MEM_ARENA_DIR)/include -I$(MEM_ARENA_DIR)/src \
+	$(CC) $(CFLAGS) -I$(MEM_ARENA_DIR)/include -I$(MEM_ARENA_DIR)/src -I../controller \
 		$< $(SRC_DIR)/common.c $(MEM_ARENA_SRCS) -o $@ $(LDFLAGS) -llz4
 
 smoke: all
