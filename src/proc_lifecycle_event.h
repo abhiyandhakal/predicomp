@@ -15,6 +15,7 @@ typedef uint64_t proc_evt_u64;
 enum proc_lifecycle_event_type {
     PROC_LIFECYCLE_EVENT_EXEC = 1,
     PROC_LIFECYCLE_EVENT_EXIT = 2,
+    PROC_LIFECYCLE_EVENT_FORK = 3,
 };
 
 struct proc_lifecycle_event {

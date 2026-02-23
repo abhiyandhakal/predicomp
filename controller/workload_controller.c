@@ -36,10 +36,13 @@ struct tracked_proc {
     pid_t pid;
     uint32_t generation;
     uint64_t exec_event_ns;
+    uint64_t exit_event_ns;
     uint64_t deadline_ns;
     uint64_t controller_seen_ns;
     uint64_t compress_request_ns;
     uint64_t compress_ack_ns;
+    pid_t parent_pid_last_seen;
+    pid_t lineage_root_pid;
     char comm[PROC_LIFECYCLE_COMM_LEN];
     char workload_name[WL_CONTROLLER_WORKLOAD_NAME_LEN];
     int enrolled;
@@ -363,7 +366,8 @@ static void csv_write_header(FILE *fp)
 {
     fprintf(fp,
             "pid,generation,comm,workload_name,enrolled,use_mem_arena,exec_event_ns,deadline_ns,"
-            "compress_sent,compress_ack,exited,missed_due_to_no_enroll,compress_request_ns,"
+            "exit_event_ns,parent_pid_last_seen,lineage_root_pid,compress_sent,compress_ack,"
+            "exited,missed_due_to_no_enroll,compress_request_ns,"
             "compress_ack_ns,compress_latency_ms,trigger_count,arena_cap_mb,arena_min_savings_pct,"
             "region_mb,total_input_bytes_attempted,chunks_admitted,logical_input_bytes,"
             "compressed_bytes_live,pool_bytes_live,pool_bytes_free,pool_compactions,compress_ops,"
@@ -380,9 +384,9 @@ static void csv_write_row(FILE *fp, const struct tracked_proc *p)
     }
 
     fprintf(fp,
-            "%d,%u,%s,%s,%d,%d,%" PRIu64 ",%" PRIu64 ",%d,%d,%d,%d,%" PRIu64 ",%" PRIu64 ",%.3f,"
-            "%" PRIu64 ",%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%"
-            PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+            "%d,%u,%s,%s,%d,%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%d,%d,%d,%d,%d,%d,%" PRIu64
+            ",%" PRIu64 ",%.3f,%" PRIu64 ",%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+            ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
             p->pid,
             p->generation,
             p->comm,
@@ -391,6 +395,9 @@ static void csv_write_row(FILE *fp, const struct tracked_proc *p)
             p->use_mem_arena,
             p->exec_event_ns,
             p->deadline_ns,
+            p->exit_event_ns,
+            p->parent_pid_last_seen,
+            p->lineage_root_pid,
             p->compress_sent,
             p->compress_ack,
             p->exited,
@@ -451,6 +458,8 @@ static void tracked_proc_reset_for_exec(struct tracked_proc *p, const struct pro
     uint32_t preserve_cap = p->arena_cap_mb;
     uint32_t preserve_min_savings = p->arena_min_savings_pct;
     uint32_t preserve_region_mb = p->region_mb;
+    pid_t preserve_parent = p->parent_pid_last_seen;
+    pid_t preserve_root = p->lineage_root_pid;
 
     memcpy(preserve_workload, p->workload_name, sizeof(preserve_workload));
 
@@ -462,6 +471,7 @@ static void tracked_proc_reset_for_exec(struct tracked_proc *p, const struct pro
     memcpy(p->comm, ev->comm, sizeof(p->comm));
 
     p->exec_event_ns = ev->ktime_ns;
+    p->exit_event_ns = 0;
     p->deadline_ns = ev->ktime_ns + delay_ns;
     p->controller_seen_ns = now_ns();
     p->compress_request_ns = 0;
@@ -483,6 +493,8 @@ static void tracked_proc_reset_for_exec(struct tracked_proc *p, const struct pro
     p->decompress_ops = 0;
     p->evictions_lru = 0;
     p->incompressible_chunks = 0;
+    p->parent_pid_last_seen = preserve_parent;
+    p->lineage_root_pid = preserve_root;
 
     p->enrolled = preserve_enrolled;
     p->use_mem_arena = preserve_use_mem_arena;
@@ -490,6 +502,33 @@ static void tracked_proc_reset_for_exec(struct tracked_proc *p, const struct pro
     p->arena_cap_mb = preserve_cap;
     p->arena_min_savings_pct = preserve_min_savings;
     p->region_mb = preserve_region_mb;
+}
+
+static void handle_fork_event(struct controller_state *st, const struct proc_lifecycle_event *ev)
+{
+    struct tracked_proc *child;
+    struct tracked_proc *parent;
+    pid_t root_pid;
+
+    child = pid_table_get_or_insert(&st->table, (pid_t)ev->pid);
+    if (child == NULL) {
+        fprintf(stderr, "pid table insert failed for fork child pid=%u\n", ev->pid);
+        return;
+    }
+
+    parent = pid_table_get_or_insert(&st->table, (pid_t)ev->ppid);
+    if (parent != NULL && parent->lineage_root_pid == 0 && parent->pid > 0) {
+        parent->lineage_root_pid = parent->pid;
+    }
+
+    child->parent_pid_last_seen = (pid_t)ev->ppid;
+    root_pid = (pid_t)ev->ppid;
+    if (parent != NULL && parent->lineage_root_pid > 0) {
+        root_pid = parent->lineage_root_pid;
+    }
+    if (root_pid > 0) {
+        child->lineage_root_pid = root_pid;
+    }
 }
 
 static int handle_exec_event(struct controller_state *st, const struct proc_lifecycle_event *ev)
@@ -504,6 +543,9 @@ static int handle_exec_event(struct controller_state *st, const struct proc_life
     }
 
     tracked_proc_reset_for_exec(p, ev, st->delay_ns);
+    if (p->lineage_root_pid == 0 && p->pid > 0) {
+        p->lineage_root_pid = p->pid;
+    }
 
     item.deadline_ns = p->deadline_ns;
     item.pid = p->pid;
@@ -534,6 +576,7 @@ static int handle_exit_event(struct controller_state *st, const struct proc_life
         memcpy(p->comm, ev->comm, sizeof(p->comm));
     }
     p->exited = 1;
+    p->exit_event_ns = ev->ktime_ns;
 
     if (st->verbose) {
         log_proc("exit", p);
@@ -559,6 +602,10 @@ static int on_lifecycle_event(void *ctx, void *data, size_t data_sz)
     }
     if (ev->type == PROC_LIFECYCLE_EVENT_EXIT) {
         handle_exit_event(st, ev);
+        return 0;
+    }
+    if (ev->type == PROC_LIFECYCLE_EVENT_FORK) {
+        handle_fork_event(st, ev);
         return 0;
     }
 
@@ -609,6 +656,9 @@ static void handle_enroll_msg(struct controller_state *st, const struct wl_contr
     p->arena_cap_mb = msg->arena_cap_mb;
     p->arena_min_savings_pct = msg->arena_min_savings_pct;
     p->region_mb = msg->region_mb;
+    if (p->lineage_root_pid == 0 && p->pid > 0) {
+        p->lineage_root_pid = p->pid;
+    }
     memset(p->workload_name, 0, sizeof(p->workload_name));
     memcpy(p->workload_name, msg->workload_name, sizeof(p->workload_name));
 

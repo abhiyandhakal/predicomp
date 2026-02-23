@@ -65,3 +65,19 @@ int handle_sched_process_exit(struct trace_event_raw_sched_process_exit *ctx)
     bpf_ringbuf_submit(event, 0);
     return 0;
 }
+
+SEC("tracepoint/sched/sched_process_fork")
+int handle_sched_process_fork(struct trace_event_raw_sched_process_fork *ctx)
+{
+    struct proc_lifecycle_event *event;
+
+    event = reserve_event(PROC_LIFECYCLE_EVENT_FORK, (uint32_t)ctx->child_pid);
+    if (event == NULL) {
+        return 0;
+    }
+
+    event->ppid = (uint32_t)ctx->parent_pid;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    bpf_ringbuf_submit(event, 0);
+    return 0;
+}
