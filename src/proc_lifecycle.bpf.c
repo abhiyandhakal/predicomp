@@ -61,7 +61,7 @@ int handle_sched_process_exit(struct trace_event_raw_sched_process_exit *ctx)
         return 0;
     }
 
-    __builtin_memcpy(event->comm, ctx->comm, sizeof(event->comm));
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
     bpf_ringbuf_submit(event, 0);
     return 0;
 }
