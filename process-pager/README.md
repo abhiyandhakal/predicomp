@@ -55,9 +55,11 @@ Terminal 1 (daemon):
 ```bash
 cd process-pager
 sudo ./predicomp_pager -v \
+  --csv /tmp/predicomp_pager_sessions.csv \
   --cold-age-ms 500 \
   --damon-read-ms 200 \
-  --soft-cap-bytes $((64 * 1024 * 1024))
+  --soft-cap-bytes $((64 * 1024 * 1024)) \
+  --latency-sample-step 1
 ```
 
 Terminal 2 (your target process):
@@ -116,6 +118,39 @@ The daemon prints a session summary with counters such as:
 - restore success/failures
 - UFFD ioctl failures
 - fault service latency totals/max
+- fault/restore p95/p99 latency highlights
+- daemon CPU usage split by thread (`control`, `bg`, `fault`)
+
+The daemon can also write one CSV row per session (`--csv`) with:
+
+- all session counters
+- per-thread CPU ns + CPU% of session wall time
+- compressor CPU/wall timing totals and sampled p50/p95/p99/max
+- decompressor/restore timing totals and sampled p50/p95/p99/max
+- fault-service latency percentiles (all/missing/WP)
+- client-eviction RPC and `process_madvise` latency percentiles
+
+## Metric Semantics (Important)
+
+- `fault_*` latency metrics:
+  end-to-end fault service time in the daemon fault thread (user stall proxy)
+- `restore_*` latency metrics:
+  compressed-page restore path latency (decompressor-attributable path)
+- `restore_codec_*` latency metrics:
+  LZ4 decompression step only (excludes `UFFDIO_COPY` and other fault handling)
+- `*_cpu_*` metrics:
+  measured with `CLOCK_THREAD_CPUTIME_ID` in daemon threads (not target process CPU)
+
+## Example VM Behavior (Current Arch Guest)
+
+On the current VM kernel (`process_madvise(MADV_DONTNEED)` returns `EINVAL` remotely), the daemon
+should automatically switch to cooperative client eviction and still produce real missing faults:
+
+- `process_madvise_unsupported=1`
+- `client_evict_ok > 0`
+- `faults_missing > 0`
+- `restore_ok > 0`
+- `compress_wp_only_fallback=0` (if cooperative eviction succeeds consistently)
 
 On kernels where remote `process_madvise` is unsupported but cooperative eviction works, you
 should expect:
