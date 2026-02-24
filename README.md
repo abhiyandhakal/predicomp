@@ -30,6 +30,19 @@ Detailed formula and benchmark application guidance live in `compressor-monitor/
 - `clang`, `bpftool`, `libbpf`, `pkg-config`, `make`
 - root privileges to load/attach BPF
 
+## VM Lab (Recommended for Measurements)
+
+For reproducible eBPF/DAMON/mem-arena experiments, use the dedicated QEMU/KVM
+Arch guest lab in `vm/` instead of the host machine.
+
+See `vm/README.md` for:
+
+- QEMU/KVM VM setup scripts
+- Arch guest bootstrap steps
+- 9p repo sharing
+- guest environment validation (BTF/DAMON/tracefs)
+- canonical `interactive_burst --arena-autoloops` runs inside the guest
+
 ## Build all
 
 ```bash
@@ -182,3 +195,4 @@ sudo ./workloads/bin/interactive_burst \
 ```
 
 See `mem-arena/README.md` for loop flags, DAMON requirements, stats, and limitations.
+For lower-noise measurement runs, prefer running this inside the VM lab (`vm/README.md`).

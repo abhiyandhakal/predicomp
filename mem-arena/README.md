@@ -131,6 +131,7 @@ Notes:
 
 - `--arena-autoloops` currently uses the kernel DAMON sysfs admin interface for hotness classification and therefore requires root privileges.
 - DAMON is used for classification only in this pilot (no DAMOS memory actions are applied).
+- For lower-noise measurements, run the pilot inside the VM lab described in `vm/README.md`.
 
 ## Stats
 

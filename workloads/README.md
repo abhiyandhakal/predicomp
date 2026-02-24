@@ -161,6 +161,9 @@ sudo ./workloads/bin/interactive_burst \
 `--arena-autoloops` currently uses the kernel DAMON sysfs admin interface for
 hotness classification, so root privileges are required for the pilot path.
 
+For measured runs, prefer the VM lab (`vm/README.md`) and run workloads from the
+shared mount (default guest path: `/mnt/predicomp`).
+
 See `mem-arena/README.md` for arena architecture and metric definitions.
 For formal per-process RAM before/after compression + compressor CPU accounting,
 use `mem-arena/process_mem_bench`.
