@@ -1,0 +1,9 @@
+# Candidate services to review/disable in the guest for pragmatic experiment isolation.
+# Disable only if present and not needed in your guest setup.
+# Example:
+#   sudo systemctl disable --now systemd-timesyncd.service
+#   sudo systemctl disable --now man-db.timer man-db.service
+
+systemd-timesyncd.service
+man-db.timer
+paccache.timer

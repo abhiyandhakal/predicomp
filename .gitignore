@@ -6,3 +6,5 @@ src/*.o
 src/*.skel.h
 workload_controller
 workloads/results/controller-matrix/
+vm/images/
+vm/run/
