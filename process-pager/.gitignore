@@ -1,0 +1,3 @@
+predicomp_pager
+libpredicomp_client.a
+src/*.o
