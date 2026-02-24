@@ -1,8 +1,11 @@
 #include "common.h"
 
 #include <mem_arena.h>
+#include <predicomp_client.h>
+#include <protocol.h>
 
 #include <inttypes.h>
+#include <sys/mman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +58,8 @@ static void usage(const char *prog)
     fprintf(stderr, "  --active-ms <n>            active touch phase (default %d)\n", DEFAULT_ACTIVE_MS);
     fprintf(stderr, "  --idle-ms <n>              idle phase (default %d)\n", DEFAULT_IDLE_MS);
     fprintf(stderr, "  --use-mem-arena            enable managed compression arena\n");
+    fprintf(stderr, "  --use-process-pager        enable cooperative process-pager mode\n");
+    fprintf(stderr, "  --pager-sock <path>        process-pager daemon UNIX socket (default /tmp/predicomp-pager.sock)\n");
     fprintf(stderr, "  --arena-cap-mb <n>         arena compressed pool MB (default 256)\n");
     fprintf(stderr, "  --arena-min-savings-pct <n> min savings threshold %% (default 5)\n");
     fprintf(stderr, "  --arena-stats-json <path>  write arena stats JSON\n");
@@ -74,6 +79,8 @@ int main(int argc, char **argv)
     int active_ms = DEFAULT_ACTIVE_MS;
     int idle_ms = DEFAULT_IDLE_MS;
     int use_mem_arena = 0;
+    int use_process_pager = 0;
+    const char *pager_sock = NULL;
     int arena_cap_mb = 256;
     int arena_min_savings_pct = 5;
     const char *arena_stats_json = NULL;
@@ -90,10 +97,17 @@ int main(int argc, char **argv)
     struct mem_arena *arena = NULL;
     int region_id = -1;
     unsigned char *raw_buf = NULL;
+    int used_mmap_region = 0;
     struct mem_arena_stats arena_stats;
+    struct predicomp_client *pager_client = NULL;
+    struct predicomp_client_config pager_cfg;
+    struct predicomp_range_handle pager_range;
+    int pager_range_registered = 0;
 
     wl_init_common_opts(&common);
     memset(&arena_stats, 0, sizeof(arena_stats));
+    memset(&pager_cfg, 0, sizeof(pager_cfg));
+    memset(&pager_range, 0, sizeof(pager_range));
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
@@ -106,6 +120,10 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--use-mem-arena") == 0) {
             use_mem_arena = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--use-process-pager") == 0) {
+            use_process_pager = 1;
             continue;
         }
         if (strcmp(argv[i], "--arena-autoloops") == 0) {
@@ -140,6 +158,10 @@ int main(int argc, char **argv)
             arena_cap_mb = wl_parse_int_arg("--arena-cap-mb", argv[++i], 8, 65536);
             continue;
         }
+        if (strcmp(argv[i], "--pager-sock") == 0) {
+            pager_sock = argv[++i];
+            continue;
+        }
         if (strcmp(argv[i], "--arena-min-savings-pct") == 0) {
             arena_min_savings_pct = wl_parse_int_arg("--arena-min-savings-pct", argv[++i], 0, 95);
             continue;
@@ -169,6 +191,14 @@ int main(int argc, char **argv)
     }
 
     if (wl_validate_common_opts(&common) != 0) {
+        return 2;
+    }
+    if (use_mem_arena && use_process_pager) {
+        fprintf(stderr, "--use-mem-arena and --use-process-pager are mutually exclusive\n");
+        return 2;
+    }
+    if (pager_sock != NULL && !use_process_pager) {
+        fprintf(stderr, "--pager-sock requires --use-process-pager\n");
         return 2;
     }
     len = (size_t)region_mb * 1024UL * 1024UL;
@@ -235,14 +265,55 @@ int main(int argc, char **argv)
             }
         }
     } else {
-        raw_buf = malloc(len);
-        if (raw_buf == NULL) {
-            perror("malloc");
-            return 1;
+        if (use_process_pager) {
+            pager_cfg.daemon_sock_path = pager_sock;
+            pager_cfg.enable_wp = 1;
+            pager_cfg.enable_missing = 1;
+
+            raw_buf = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw_buf == MAP_FAILED) {
+                perror("mmap");
+                return 1;
+            }
+            used_mmap_region = 1;
+
+            if (predicomp_client_open(&pager_client, &pager_cfg) != 0) {
+                perror("predicomp_client_open");
+                munmap(raw_buf, len);
+                return 1;
+            }
+            if (predicomp_client_register_range(pager_client,
+                                                raw_buf,
+                                                len,
+                                                PREDICOMP_RANGE_F_ANON_PRIVATE | PREDICOMP_RANGE_F_WRITABLE,
+                                                &pager_range) != 0) {
+                perror("predicomp_client_register_range");
+                predicomp_client_close(pager_client);
+                munmap(raw_buf, len);
+                return 1;
+            }
+            pager_range_registered = 1;
+        } else {
+            raw_buf = malloc(len);
+            if (raw_buf == NULL) {
+                perror("malloc");
+                return 1;
+            }
         }
     }
 
     memset(raw_buf, 0, len);
+
+    if (use_process_pager) {
+        if (predicomp_client_start(pager_client) != 0) {
+            perror("predicomp_client_start");
+            predicomp_client_close(pager_client);
+            if (used_mmap_region) {
+                munmap(raw_buf, len);
+            }
+            return 1;
+        }
+    }
 
     start_ns = wl_now_ns();
     deadline_ns = start_ns + (uint64_t)common.duration_sec * 1000000000ULL;
@@ -279,6 +350,10 @@ int main(int argc, char **argv)
         wl_sleep_ns((uint64_t)idle_ms * 1000000ULL);
     }
 
+    if (use_process_pager) {
+        (void)predicomp_client_stop(pager_client);
+    }
+
     if (use_mem_arena) {
         if (mem_arena_get_stats(arena, &arena_stats) != 0) {
             fprintf(stderr, "mem_arena_get_stats failed\n");
@@ -294,7 +369,13 @@ int main(int argc, char **argv)
         wl_print_json_kv_u64("touches", touches, false);
         wl_print_json_kv_u64("region_mb", (uint64_t)region_mb, false);
         wl_print_json_kv_u64("use_mem_arena", (uint64_t)use_mem_arena, false);
+        wl_print_json_kv_u64("use_process_pager", (uint64_t)use_process_pager, false);
         wl_print_json_kv_u64("arena_autoloops", (uint64_t)arena_autoloops, false);
+        if (use_process_pager) {
+            wl_print_json_kv_str("pager_sock", pager_sock != NULL ? pager_sock : "/tmp/predicomp-pager.sock", false);
+            wl_print_json_kv_u64("pager_range_registered", (uint64_t)pager_range_registered, false);
+            wl_print_json_kv_u64("pager_range_id", (uint64_t)pager_range.id, false);
+        }
         if (use_mem_arena) {
             wl_print_json_kv_u64("arena_compress_ops", arena_stats.compress_ops, false);
             wl_print_json_kv_u64("arena_decompress_ops", arena_stats.decompress_ops, false);
@@ -313,7 +394,7 @@ int main(int argc, char **argv)
         wl_print_json_kv_double("elapsed_ms", elapsed_ms, true);
         printf("}\n");
     } else {
-        printf("interactive_burst region_mb=%d active_ms=%d idle_ms=%d duration_sec=%d touches=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d arena_autoloops=%d",
+        printf("interactive_burst region_mb=%d active_ms=%d idle_ms=%d duration_sec=%d touches=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d use_process_pager=%d arena_autoloops=%d",
                region_mb,
                active_ms,
                idle_ms,
@@ -321,7 +402,14 @@ int main(int argc, char **argv)
                touches,
                elapsed_ms,
                use_mem_arena,
+               use_process_pager,
                arena_autoloops);
+        if (use_process_pager) {
+            printf(" pager_sock=%s pager_range_registered=%d pager_range_id=%d",
+                   pager_sock != NULL ? pager_sock : "/tmp/predicomp-pager.sock",
+                   pager_range_registered,
+                   pager_range.id);
+        }
         if (use_mem_arena) {
             printf(" arena_compress_ops=%" PRIu64 " arena_decompress_ops=%" PRIu64 " arena_evictions_lru=%" PRIu64
                    " arena_hotness_epoch=%" PRIu64 " arena_damon_snapshots=%" PRIu64 " arena_damon_regions=%" PRIu64
@@ -355,7 +443,14 @@ int main(int argc, char **argv)
         }
         mem_arena_destroy(arena);
     } else {
-        free(raw_buf);
+        if (pager_client != NULL) {
+            predicomp_client_close(pager_client);
+        }
+        if (used_mmap_region) {
+            munmap(raw_buf, len);
+        } else {
+            free(raw_buf);
+        }
     }
 
     return 0;

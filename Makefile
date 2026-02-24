@@ -7,7 +7,7 @@ LIBBPF_LIBS ?= $(shell pkg-config --libs libbpf 2>/dev/null)
 CFLAGS += -O2 -g -Wall -Wextra
 BPF_CFLAGS += -O2 -g -target bpf -D__TARGET_ARCH_x86
 
-.PHONY: all clean run run-page-fault run-swap-probe run-proc-lifecycle workloads workloads-smoke ram-pool-status mem-arena mem-arena-demo mem-arena-bench controller
+.PHONY: all clean run run-page-fault run-swap-probe run-proc-lifecycle workloads workloads-smoke ram-pool-status mem-arena mem-arena-demo mem-arena-bench controller process-pager process-pager-client
 
 all: proc_create page_fault swap_probe proc_lifecycle workload_controller workloads mem-arena
 
@@ -67,8 +67,14 @@ run-swap-probe: swap_probe
 run-proc-lifecycle: workload_controller
 	sudo ./workload_controller
 
-workloads:
+workloads: process-pager-client
 	$(MAKE) -C workloads
+
+process-pager:
+	$(MAKE) -C process-pager
+
+process-pager-client:
+	$(MAKE) -C process-pager libpredicomp_client.a
 
 workloads-smoke: workloads
 	$(MAKE) -C workloads smoke
@@ -88,3 +94,4 @@ ram-pool-status:
 clean:
 	rm -f proc_create page_fault swap_probe proc_lifecycle workload_controller vmlinux.h src/*.o src/*.skel.h
 	$(MAKE) -C workloads clean
+	$(MAKE) -C process-pager clean

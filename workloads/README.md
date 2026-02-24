@@ -27,6 +27,7 @@ make -C workloads smoke
 ```
 
 Build also links `mem-arena/` so workload binaries can optionally run in swap-free managed compression mode.
+`interactive_burst` can also link the cooperative `process-pager` client (`process-pager/`).
 
 ## Custom workloads (C binaries)
 
@@ -71,6 +72,9 @@ All binaries support strict defaults and common flags:
 - Intent: short active memory bursts followed by idle windows.
 - Good for: hot->cold->hot transitions relevant to early decompression.
 - Typical eBPF signals: fault bursts, then quiet periods, then bursts again.
+- Optional modes:
+  - `--use-mem-arena` for internal managed compression (pilot path)
+  - `--use-process-pager` for cooperative userfaultfd + pager daemon experiments (`--use-mem-arena` and `--use-process-pager` are mutually exclusive)
 - Example:
 ```bash
 ./workloads/bin/interactive_burst --duration-sec 60 --region-mb 256 --active-ms 100 --idle-ms 500
@@ -126,6 +130,34 @@ Shared flags:
 - `--arena-cap-mb <n>`
 - `--arena-min-savings-pct <n>`
 - `--arena-stats-json <path>`
+
+## Optional cooperative process-pager mode (`interactive_burst`)
+
+`interactive_burst` can register its anonymous working region with the local
+`process-pager` daemon via the `predicomp_client` API.
+
+Flags:
+
+- `--use-process-pager`
+- `--pager-sock <path>` (optional, default `/tmp/predicomp-pager.sock`)
+
+Notes:
+
+- Mutually exclusive with `--use-mem-arena`
+- The workload explicitly registers the touched region before the timed run and starts/stops the pager client around the run loop
+- Start the pager daemon separately (see `process-pager/`)
+
+Example:
+
+```bash
+./workloads/bin/interactive_burst \
+  --duration-sec 20 \
+  --region-mb 256 \
+  --active-ms 100 \
+  --idle-ms 400 \
+  --use-process-pager \
+  --pager-sock /tmp/predicomp-pager.sock
+```
 
 `interactive_burst` (internal-only pilot) also supports:
 
