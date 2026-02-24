@@ -116,6 +116,8 @@ struct metrics {
     uint64_t uffdio_wp_failures;
     uint64_t uffdio_zeropage_failures;
     uint64_t process_madvise_failures;
+    uint64_t process_madvise_unsupported;
+    uint64_t compress_wp_only_fallback;
     uint64_t compress_ns_total;
     uint64_t restore_ns_total;
     uint64_t fault_service_ns_total;
@@ -145,6 +147,8 @@ struct session {
     uint64_t region_min;
     uint64_t region_max;
     struct metrics m;
+    int evict_wp_only_mode;
+    int logged_process_madvise_errno;
 };
 
 static volatile sig_atomic_t g_stop = 0;
@@ -395,7 +399,8 @@ static int build_page_table(struct session *s)
             p->addr = (uintptr_t)(s->ranges[i].start + off);
             p->range_id = s->ranges[i].id;
             p->state = PAGE_STATE_PRESENT;
-            p->dirty = 1;
+            p->dirty = 0;
+            p->last_damon_seen_ns = now_ns();
             if (map_put(s, p->addr, (uint32_t)idx) != 0) {
                 return -1;
             }
@@ -444,21 +449,6 @@ static int uffd_writeprotect_page(struct session *s, uintptr_t addr, int enable)
     wp.range.start = (unsigned long)addr;
     wp.range.len = PAGE_SZ;
     wp.mode = enable ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
-    if (ioctl(s->uffd, UFFDIO_WRITEPROTECT, &wp) != 0) {
-        s->m.uffdio_wp_failures++;
-        return -1;
-    }
-    return 0;
-}
-
-static int arm_wp_range(struct session *s, uint64_t start, uint64_t len)
-{
-    struct uffdio_writeprotect wp;
-
-    memset(&wp, 0, sizeof(wp));
-    wp.range.start = start;
-    wp.range.len = len;
-    wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
     if (ioctl(s->uffd, UFFDIO_WRITEPROTECT, &wp) != 0) {
         s->m.uffdio_wp_failures++;
         return -1;
@@ -600,11 +590,6 @@ static int handle_missing_fault_locked(struct session *s, struct page_entry *p, 
         p->dirty = 0;
         p->is_cold = 0;
         p->wp_active = 0;
-        if (uffd_writeprotect_page(s, addr, 1) == 0) {
-            p->wp_active = 1;
-            p->dirty = 0;
-            s->m.pages_wp_armed++;
-        }
         return 0;
     }
 
@@ -616,19 +601,40 @@ static int handle_missing_fault_locked(struct session *s, struct page_entry *p, 
     p->dirty = 0;
     p->is_cold = 0;
     p->wp_active = 0;
-    if (uffd_writeprotect_page(s, addr, 1) == 0) {
-        p->wp_active = 1;
-        s->m.pages_wp_armed++;
-    }
     return 0;
 }
 
 static int handle_wp_fault_locked(struct session *s, struct page_entry *p, uintptr_t addr)
 {
+    uint64_t t0;
+
     s->m.faults_wp_total++;
     if (p == NULL) {
         s->m.faults_unexpected_total++;
         return -1;
+    }
+    t0 = now_ns();
+    if (p->state == PAGE_STATE_COMPRESSED && p->blob != NULL && p->blob_len > 0) {
+        unsigned char pagebuf[PAGE_SZ];
+        int rc;
+
+        rc = mem_arena_lz4_decompress(p->blob, (int)p->blob_len, pagebuf, (int)PAGE_SZ);
+        if (rc != (int)PAGE_SZ) {
+            s->m.restore_failures++;
+            return -1;
+        }
+        s->m.restore_success++;
+        s->m.restore_ns_total += now_ns() - t0;
+        p->last_restore_ns = now_ns();
+        if (s->m.store_bytes_live >= p->blob_len) {
+            s->m.store_bytes_live -= p->blob_len;
+        } else {
+            s->m.store_bytes_live = 0;
+        }
+        free(p->blob);
+        p->blob = NULL;
+        p->blob_len = 0;
+        p->state = PAGE_STATE_PRESENT;
     }
     if (uffd_writeprotect_page(s, addr, 0) != 0) {
         return -1;
@@ -738,15 +744,38 @@ static void apply_damon_snapshot_locked(struct session *s, const struct pager_da
             }
             p->last_damon_accesses = (uint32_t)snap->regions[i].nr_accesses;
             p->last_damon_age = snap->regions[i].age;
-            p->last_damon_seen_ns = now_ns();
-            if (snap->regions[i].nr_accesses == 0 && snap->regions[i].age >= s->cfg.cold_age_ms) {
-                if (!p->is_cold) {
-                    s->m.pages_cold_marked++;
-                }
-                p->is_cold = 1;
-            } else {
+            if (snap->regions[i].nr_accesses > 0) {
+                p->last_damon_seen_ns = now_ns();
                 p->is_cold = 0;
             }
+        }
+    }
+}
+
+static void refresh_time_cold_locked(struct session *s, uint64_t now)
+{
+    uint64_t cold_ns;
+    size_t i;
+
+    cold_ns = (uint64_t)s->cfg.cold_age_ms * 1000000ULL;
+    if (cold_ns == 0) {
+        cold_ns = 500000000ULL;
+    }
+    for (i = 0; i < s->nr_pages; i++) {
+        struct page_entry *p = &s->pages[i];
+
+        if (p->state != PAGE_STATE_PRESENT) {
+            continue;
+        }
+        if (p->wp_active) {
+            p->is_cold = 0;
+            continue;
+        }
+        if (now >= p->last_damon_seen_ns + cold_ns) {
+            if (!p->is_cold) {
+                s->m.pages_cold_marked++;
+            }
+            p->is_cold = 1;
         }
     }
 }
@@ -792,6 +821,7 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
     ssize_t nread;
     int clen;
     int madv_rc;
+    int evict_done;
     uint8_t *new_blob;
     uint64_t t0;
 
@@ -812,27 +842,57 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
     nread = process_vm_readv(s->pid, &local_iov, 1, &remote_iov, 1, 0);
     if (nread != (ssize_t)PAGE_SZ) {
         s->m.compress_read_failures++;
+        (void)uffd_writeprotect_page(s, p->addr, 0);
+        p->wp_active = 0;
         return -1;
     }
 
     clen = mem_arena_lz4_compress(pagebuf, PAGE_SZ, compbuf, (int)sizeof(compbuf), 1);
     if (clen <= 0 || clen >= (int)PAGE_SZ) {
         s->m.compress_skips_notbeneficial++;
+        (void)uffd_writeprotect_page(s, p->addr, 0);
+        p->wp_active = 0;
         return 0;
     }
 
     new_blob = malloc((size_t)clen);
     if (new_blob == NULL) {
+        (void)uffd_writeprotect_page(s, p->addr, 0);
+        p->wp_active = 0;
         return -1;
     }
     memcpy(new_blob, compbuf, (size_t)clen);
 
-    madv_rc = process_madvise_wrap(s->pidfd, (void *)p->addr, PAGE_SZ, MADV_DONTNEED);
-    if (madv_rc < 0) {
-        free(new_blob);
-        s->m.process_madvise_failures++;
-        s->m.compress_evict_failures++;
-        return -1;
+    evict_done = 0;
+    if (!s->evict_wp_only_mode) {
+        madv_rc = process_madvise_wrap(s->pidfd, (void *)p->addr, PAGE_SZ, MADV_DONTNEED);
+        if (madv_rc < 0) {
+            int saved_errno;
+
+            saved_errno = errno;
+            s->m.process_madvise_failures++;
+            if (!s->logged_process_madvise_errno) {
+                log_msg(s,
+                        "predicomp_pager: process_madvise(MADV_DONTNEED) failed errno=%d (%s); "
+                        "switching to wp-only compressed-page fallback\n",
+                        saved_errno,
+                        strerror(saved_errno));
+                s->logged_process_madvise_errno = 1;
+            }
+            if (saved_errno == EINVAL || saved_errno == ENOSYS || saved_errno == EOPNOTSUPP) {
+                s->evict_wp_only_mode = 1;
+                s->m.process_madvise_unsupported++;
+            } else {
+                free(new_blob);
+                s->m.compress_evict_failures++;
+                (void)uffd_writeprotect_page(s, p->addr, 0);
+                p->wp_active = 0;
+                errno = saved_errno;
+                return -1;
+            }
+        } else {
+            evict_done = 1;
+        }
     }
 
     if (p->blob != NULL) {
@@ -846,7 +906,12 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
     p->blob = new_blob;
     p->blob_len = (uint32_t)clen;
     p->state = PAGE_STATE_COMPRESSED;
-    p->wp_active = 0;
+    if (evict_done) {
+        p->wp_active = 0;
+    } else {
+        p->wp_active = 1;
+        s->m.compress_wp_only_fallback++;
+    }
     p->dirty = 0;
     p->last_compress_ns = now_ns();
 
@@ -880,6 +945,7 @@ static void *bg_thread_main(void *arg)
             if (rc == 0) {
                 pthread_mutex_lock(&s->mu);
                 apply_damon_snapshot_locked(s, &snap);
+                refresh_time_cold_locked(s, tnow);
                 pthread_mutex_unlock(&s->mu);
                 pager_damon_snapshot_free(&snap);
             } else if (rc < 0) {
@@ -892,6 +958,7 @@ static void *bg_thread_main(void *arg)
 
         compressed_this_round = 0;
         pthread_mutex_lock(&s->mu);
+        refresh_time_cold_locked(s, tnow);
         for (i = 0; i < s->nr_pages; i++) {
             struct page_entry *p;
             int arm_rc;
@@ -902,9 +969,6 @@ static void *bg_thread_main(void *arg)
             }
             arm_rc = arm_wp_for_candidate_locked(s, p);
             if (arm_rc < 0) {
-                continue;
-            }
-            if (arm_rc > 0) {
                 continue;
             }
             if (compress_one_page_locked(s, p) > 0) {
@@ -936,7 +1000,8 @@ static void dump_metrics(const struct session *s)
             " faults_missing=%" PRIu64 " faults_wp=%" PRIu64 " faults_unexpected=%" PRIu64
             " restore_ok=%" PRIu64 " restore_fail=%" PRIu64
             " uffd_copy_fail=%" PRIu64 " uffd_wp_fail=%" PRIu64 " uffd_zero_fail=%" PRIu64
-            " process_madvise_fail=%" PRIu64
+            " process_madvise_fail=%" PRIu64 " process_madvise_unsupported=%" PRIu64
+            " compress_wp_only_fallback=%" PRIu64
             " fault_ns_total=%" PRIu64 " fault_ns_max=%" PRIu64
             " compress_ns_total=%" PRIu64 " restore_ns_total=%" PRIu64 "\n",
             s->pid,
@@ -967,6 +1032,8 @@ static void dump_metrics(const struct session *s)
             m->uffdio_wp_failures,
             m->uffdio_zeropage_failures,
             m->process_madvise_failures,
+            m->process_madvise_unsupported,
+            m->compress_wp_only_fallback,
             m->fault_service_ns_total,
             m->fault_service_ns_max,
             m->compress_ns_total,
@@ -1042,8 +1109,6 @@ static void destroy_session_struct(struct session *s)
 
 static int start_runtime(struct session *s)
 {
-    size_t i;
-
     s->pidfd = pidfd_open_wrap(s->pid);
     if (s->pidfd < 0) {
         return -1;
@@ -1068,22 +1133,6 @@ static int start_runtime(struct session *s)
                 errno,
                 strerror(errno));
         memset(&s->damon, 0, sizeof(s->damon));
-    }
-
-    for (i = 0; i < s->nr_ranges; i++) {
-        if (arm_wp_range(s, s->ranges[i].start, s->ranges[i].len) == 0) {
-            uint64_t a;
-            for (a = s->ranges[i].start; a < s->ranges[i].start + s->ranges[i].len; a += PAGE_SZ) {
-                struct page_entry *p;
-
-                p = map_get_page(s, (uintptr_t)a);
-                if (p != NULL) {
-                    p->wp_active = 1;
-                    p->dirty = 0;
-                    s->m.pages_wp_armed++;
-                }
-            }
-        }
     }
 
     s->stop = 0;
