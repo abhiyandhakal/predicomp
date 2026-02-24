@@ -221,6 +221,9 @@ struct session {
 
 static volatile sig_atomic_t g_stop = 0;
 
+static void csv_write_header(FILE *fp);
+static void csv_write_session_row(FILE *fp, const struct session *s);
+
 static uint64_t now_ns(void)
 {
     struct timespec ts;
@@ -1528,6 +1531,10 @@ static void stop_session(struct session *s)
             s->m.latency_collector_ooms++;
         }
         dump_metrics(s);
+        if (s->cfg.csv_fp != NULL) {
+            csv_write_session_row(s->cfg.csv_fp, s);
+            fflush(s->cfg.csv_fp);
+        }
     }
 
     if (s->pidfd >= 0) {
@@ -1780,7 +1787,8 @@ static int handle_client(int client_fd, const struct cfg *daemon_cfg)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s [-s sock_path] [-v] [--cold-age-ms N] [--damon-read-ms N] [--soft-cap-bytes N]\n",
+            "Usage: %s [-s sock_path] [-v] [--csv path] [--cold-age-ms N] [--damon-read-ms N] "
+            "[--soft-cap-bytes N] [--latency-sample-step N] [--latency-max-samples N]\n",
             argv0);
 }
 
@@ -1814,12 +1822,197 @@ static int parse_u64(const char *s, uint64_t *out)
     return 0;
 }
 
+static double pct_of(uint64_t part, uint64_t whole)
+{
+    if (whole == 0) {
+        return 0.0;
+    }
+    return (100.0 * (double)part) / (double)whole;
+}
+
+static void csv_write_header(FILE *fp)
+{
+    fprintf(fp,
+            "session_pid,ranges_registered,pages_tracked,"
+            "session_start_ns,session_end_ns,session_wall_ns,"
+            "cold_age_ms,damon_read_tick_ms,soft_cap_bytes,latency_sample_step,latency_max_samples,"
+            "damon_setup_ok,damon_setup_fail,damon_snapshots_total,damon_regions_total,damon_read_errors,pages_cold_marked,"
+            "compress_attempts,compress_success,compress_skips_notbeneficial,compress_read_failures,compress_evict_failures,"
+            "compress_bytes_in,compress_bytes_out,store_bytes_live,store_bytes_peak,soft_cap_warnings,"
+            "faults_missing_total,faults_wp_total,faults_unexpected_total,restore_success,restore_failures,"
+            "restore_missing_count,restore_wp_count,uffdio_copy_failures,uffdio_wp_failures,uffdio_zeropage_failures,"
+            "process_madvise_failures,process_madvise_unsupported,client_evict_success,client_evict_failures,compress_wp_only_fallback,"
+            "evict_mode_remote_ok,evict_mode_client_rpc,evict_mode_wp_only,"
+            "control_thread_cpu_ns,bg_thread_cpu_ns,fault_thread_cpu_ns,daemon_cpu_ns_total,"
+            "control_thread_cpu_pct,bg_thread_cpu_pct,fault_thread_cpu_pct,daemon_cpu_pct_total,"
+            "compress_cpu_ns_total,compress_cpu_ns_max,restore_cpu_ns_total,restore_cpu_ns_max,"
+            "restore_codec_wall_ns_total,restore_codec_wall_ns_max,restore_codec_cpu_ns_total,restore_codec_cpu_ns_max,"
+            "compress_ns_total,restore_ns_total,fault_service_ns_total,fault_service_ns_max,"
+            "fault_missing_service_ns_total,fault_missing_service_ns_max,fault_wp_service_ns_total,fault_wp_service_ns_max,"
+            "client_evict_rpc_ns_total,client_evict_rpc_ns_max,process_madvise_ns_total,process_madvise_ns_max,"
+            "latency_samples_dropped,latency_collector_ooms,"
+            "compress_wall_samples,compress_wall_p50_ns,compress_wall_p95_ns,compress_wall_p99_ns,compress_wall_max_ns,"
+            "compress_cpu_samples,compress_cpu_p50_ns,compress_cpu_p95_ns,compress_cpu_p99_ns,compress_cpu_max_ns,"
+            "restore_wall_samples,restore_wall_p50_ns,restore_wall_p95_ns,restore_wall_p99_ns,restore_wall_max_ns,"
+            "restore_cpu_samples,restore_cpu_p50_ns,restore_cpu_p95_ns,restore_cpu_p99_ns,restore_cpu_max_ns,"
+            "restore_codec_wall_samples,restore_codec_wall_p50_ns,restore_codec_wall_p95_ns,restore_codec_wall_p99_ns,restore_codec_wall_max_ns,"
+            "fault_all_samples,fault_all_p50_ns,fault_all_p95_ns,fault_all_p99_ns,fault_all_max_ns,"
+            "fault_missing_samples,fault_missing_p50_ns,fault_missing_p95_ns,fault_missing_p99_ns,fault_missing_max_ns,"
+            "fault_wp_samples,fault_wp_p50_ns,fault_wp_p95_ns,fault_wp_p99_ns,fault_wp_max_ns,"
+            "client_evict_rpc_samples,client_evict_rpc_p50_ns,client_evict_rpc_p95_ns,client_evict_rpc_p99_ns,client_evict_rpc_max_ns,"
+            "process_madvise_samples,process_madvise_p50_ns,process_madvise_p95_ns,process_madvise_p99_ns,process_madvise_max_ns\n");
+}
+
+static void csv_write_latency_group(FILE *fp, const struct latency_stats *st)
+{
+    fprintf(fp,
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64,
+            st->samples,
+            st->p50_ns,
+            st->p95_ns,
+            st->p99_ns,
+            st->max_ns);
+}
+
+static void csv_write_session_row(FILE *fp, const struct session *s)
+{
+    const struct metrics *m;
+    uint64_t daemon_cpu_ns_total;
+    int evict_mode_remote_ok;
+    int evict_mode_client_rpc;
+    int evict_mode_wp_only;
+
+    m = &s->m;
+    daemon_cpu_ns_total = m->control_thread_cpu_ns + m->bg_thread_cpu_ns + m->fault_thread_cpu_ns;
+    evict_mode_remote_ok = (m->compress_success > 0 && m->process_madvise_unsupported == 0 && m->client_evict_success == 0 && m->compress_wp_only_fallback == 0) ? 1 : 0;
+    evict_mode_client_rpc = (m->client_evict_success > 0) ? 1 : 0;
+    evict_mode_wp_only = (m->compress_wp_only_fallback > 0) ? 1 : 0;
+
+    fprintf(fp,
+            "%d,%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%u,%u,%" PRIu64 ",%u,%u,"
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%d,%d,%d,"
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%.6f,%.6f,%.6f,%.6f,"
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
+            "%" PRIu64 ",%" PRIu64 ",",
+            s->pid,
+            m->ranges_registered,
+            m->pages_tracked,
+            m->session_start_ns,
+            m->session_end_ns,
+            m->session_wall_ns,
+            s->cfg.cold_age_ms,
+            s->cfg.damon_read_tick_ms,
+            s->cfg.soft_cap_bytes,
+            s->cfg.latency_sample_step,
+            s->cfg.latency_max_samples,
+            m->damon_setup_ok,
+            m->damon_setup_fail,
+            m->damon_snapshots_total,
+            m->damon_regions_total,
+            m->damon_read_errors,
+            m->pages_cold_marked,
+            m->compress_attempts,
+            m->compress_success,
+            m->compress_skips_notbeneficial,
+            m->compress_read_failures,
+            m->compress_evict_failures,
+            m->compress_bytes_in,
+            m->compress_bytes_out,
+            m->store_bytes_live,
+            m->store_bytes_peak,
+            m->soft_cap_warnings,
+            m->faults_missing_total,
+            m->faults_wp_total,
+            m->faults_unexpected_total,
+            m->restore_success,
+            m->restore_failures,
+            m->restore_missing_count,
+            m->restore_wp_count,
+            m->uffdio_copy_failures,
+            m->uffdio_wp_failures,
+            m->uffdio_zeropage_failures,
+            m->process_madvise_failures,
+            m->process_madvise_unsupported,
+            m->client_evict_success,
+            m->client_evict_failures,
+            m->compress_wp_only_fallback,
+            evict_mode_remote_ok,
+            evict_mode_client_rpc,
+            evict_mode_wp_only,
+            m->control_thread_cpu_ns,
+            m->bg_thread_cpu_ns,
+            m->fault_thread_cpu_ns,
+            daemon_cpu_ns_total,
+            pct_of(m->control_thread_cpu_ns, m->session_wall_ns),
+            pct_of(m->bg_thread_cpu_ns, m->session_wall_ns),
+            pct_of(m->fault_thread_cpu_ns, m->session_wall_ns),
+            pct_of(daemon_cpu_ns_total, m->session_wall_ns),
+            m->compress_cpu_ns_total,
+            m->compress_cpu_ns_max,
+            m->restore_cpu_ns_total,
+            m->restore_cpu_ns_max,
+            m->restore_codec_wall_ns_total,
+            m->restore_codec_wall_ns_max,
+            m->restore_codec_cpu_ns_total,
+            m->restore_codec_cpu_ns_max,
+            m->compress_ns_total,
+            m->restore_ns_total,
+            m->fault_service_ns_total,
+            m->fault_service_ns_max,
+            m->fault_missing_service_ns_total,
+            m->fault_missing_service_ns_max,
+            m->fault_wp_service_ns_total,
+            m->fault_wp_service_ns_max,
+            m->client_evict_rpc_ns_total,
+            m->client_evict_rpc_ns_max,
+            m->process_madvise_ns_total,
+            m->process_madvise_ns_max,
+            m->latency_samples_dropped,
+            m->latency_collector_ooms);
+
+    csv_write_latency_group(fp, &s->lat_stats[LAT_COMPRESS_WALL]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_COMPRESS_CPU]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_RESTORE_WALL]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_RESTORE_CPU]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_RESTORE_CODEC_WALL]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_FAULT_ALL]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_FAULT_MISSING]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_FAULT_WP]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_CLIENT_EVICT_RPC]);
+    fputc(',', fp);
+    csv_write_latency_group(fp, &s->lat_stats[LAT_PROCESS_MADVISE]);
+    fputc('\n', fp);
+}
+
 static int parse_args(int argc, char **argv, struct cfg *cfg)
 {
     int i;
 
     memset(cfg, 0, sizeof(*cfg));
     snprintf(cfg->sock_path, sizeof(cfg->sock_path), "%s", DEFAULT_SOCK_PATH);
+    cfg->csv_path[0] = '\0';
+    cfg->csv_enabled = 0;
     cfg->soft_cap_bytes = 64ULL * 1024ULL * 1024ULL;
     cfg->damon_sample_us = 5000;
     cfg->damon_aggr_us = 100000;
@@ -1828,6 +2021,9 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
     cfg->damon_nr_regions_min = 10;
     cfg->damon_nr_regions_max = 1000;
     cfg->cold_age_ms = 500;
+    cfg->latency_sample_step = 1;
+    cfg->latency_max_samples = 262144;
+    cfg->csv_fp = NULL;
     cfg->verbose = 0;
 
     for (i = 1; i < argc; i++) {
@@ -1841,6 +2037,15 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
                 errno = ENAMETOOLONG;
                 return -1;
             }
+            continue;
+        }
+        if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+            i++;
+            if (snprintf(cfg->csv_path, sizeof(cfg->csv_path), "%s", argv[i]) >= (int)sizeof(cfg->csv_path)) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            cfg->csv_enabled = 1;
             continue;
         }
         if (strcmp(argv[i], "--cold-age-ms") == 0 && i + 1 < argc) {
@@ -1860,6 +2065,21 @@ static int parse_args(int argc, char **argv, struct cfg *cfg)
         if (strcmp(argv[i], "--soft-cap-bytes") == 0 && i + 1 < argc) {
             i++;
             if (parse_u64(argv[i], &cfg->soft_cap_bytes) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--latency-sample-step") == 0 && i + 1 < argc) {
+            i++;
+            if (parse_u32(argv[i], &cfg->latency_sample_step) != 0 || cfg->latency_sample_step == 0) {
+                errno = EINVAL;
+                return -1;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--latency-max-samples") == 0 && i + 1 < argc) {
+            i++;
+            if (parse_u32(argv[i], &cfg->latency_max_samples) != 0) {
                 return -1;
             }
             continue;
@@ -1904,6 +2124,7 @@ int main(int argc, char **argv)
 {
     struct cfg cfg;
     int lfd;
+    FILE *csv_fp;
     struct sigaction sa;
 
     if (parse_args(argc, argv, &cfg) != 0) {
@@ -1917,9 +2138,39 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    csv_fp = NULL;
+    if (cfg.csv_enabled) {
+        long pos;
+
+        csv_fp = fopen(cfg.csv_path, "a+");
+        if (csv_fp == NULL) {
+            perror("predicomp_pager: fopen(csv)");
+            return 1;
+        }
+        if (fseek(csv_fp, 0, SEEK_END) != 0) {
+            perror("predicomp_pager: fseek(csv)");
+            fclose(csv_fp);
+            return 1;
+        }
+        pos = ftell(csv_fp);
+        if (pos < 0) {
+            perror("predicomp_pager: ftell(csv)");
+            fclose(csv_fp);
+            return 1;
+        }
+        if (pos == 0) {
+            csv_write_header(csv_fp);
+            fflush(csv_fp);
+        }
+        cfg.csv_fp = csv_fp;
+    }
+
     lfd = make_listen_socket(cfg.sock_path);
     if (lfd < 0) {
         perror("predicomp_pager: listen socket");
+        if (csv_fp != NULL) {
+            fclose(csv_fp);
+        }
         return 1;
     }
     fprintf(stderr, "predicomp_pager: listening on %s\n", cfg.sock_path);
@@ -1943,5 +2194,8 @@ int main(int argc, char **argv)
 
     close(lfd);
     unlink(cfg.sock_path);
+    if (csv_fp != NULL) {
+        fclose(csv_fp);
+    }
     return 0;
 }
