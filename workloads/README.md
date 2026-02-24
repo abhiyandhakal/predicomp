@@ -131,9 +131,26 @@ Shared flags:
 - `--arena-min-savings-pct <n>`
 - `--arena-stats-json <path>`
 
-## Optional cooperative process-pager mode (`interactive_burst`)
+## Optional cooperative process-pager mode (actual workload pages)
 
-`interactive_burst` can register its anonymous working region with the local
+The cooperative `process-pager` path currently supports explicit registration of
+stable anonymous private writable regions in these workloads:
+
+- `bin/interactive_burst`
+- `bin/anon_streamer`
+- `bin/random_touch_heap`
+
+Deferred (not yet supported for actual pages):
+
+- `bin/mmap_churn` (needs dynamic range register/unregister for churned mappings)
+
+Out of scope for the current process-pager prototype:
+
+- `bin/fork_exit_storm`
+- `bin/fork_touch_exit`
+- `bin/fork_exec_storm`
+
+Supported workloads register their anonymous working region with the local
 `process-pager` daemon via the `predicomp_client` API.
 
 Flags:
@@ -147,7 +164,7 @@ Notes:
 - The workload explicitly registers the touched region before the timed run and starts/stops the pager client around the run loop
 - Start the pager daemon separately (see `process-pager/`)
 
-Example:
+Example (`interactive_burst`):
 
 ```bash
 ./workloads/bin/interactive_burst \
@@ -155,6 +172,28 @@ Example:
   --region-mb 256 \
   --active-ms 100 \
   --idle-ms 400 \
+  --use-process-pager \
+  --pager-sock /tmp/predicomp-pager.sock
+```
+
+Example (`anon_streamer`):
+
+```bash
+./workloads/bin/anon_streamer \
+  --duration-sec 20 \
+  --region-mb 512 \
+  --idle-ms 300 \
+  --use-process-pager \
+  --pager-sock /tmp/predicomp-pager.sock
+```
+
+Example (`random_touch_heap`):
+
+```bash
+./workloads/bin/random_touch_heap \
+  --duration-sec 20 \
+  --region-mb 512 \
+  --ops-per-sec 400000 \
   --use-process-pager \
   --pager-sock /tmp/predicomp-pager.sock
 ```
