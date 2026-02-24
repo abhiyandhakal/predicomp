@@ -4,3 +4,5 @@ swap_probe
 vmlinux.h
 src/*.o
 src/*.skel.h
+workload_controller
+workloads/results/controller-matrix/
