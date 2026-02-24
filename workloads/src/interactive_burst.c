@@ -137,6 +137,12 @@ static void usage(const char *prog)
     fprintf(stderr, "  --arena-cap-mb <n>         arena compressed pool MB (default 256)\n");
     fprintf(stderr, "  --arena-min-savings-pct <n> min savings threshold %% (default 5)\n");
     fprintf(stderr, "  --arena-stats-json <path>  write arena stats JSON\n");
+    fprintf(stderr, "  --arena-autoloops          enable mem-arena hotness/compress/prefetch loops\n");
+    fprintf(stderr, "  --arena-t-cold-ms <n>      initial cold threshold in ms (default 2000)\n");
+    fprintf(stderr, "  --arena-prefetch-distance <n> prefetch next-k start distance (default 1)\n");
+    fprintf(stderr, "  --arena-prefetch-batch <n> prefetch batch chunks (default 4)\n");
+    fprintf(stderr, "  --arena-disable-prefetch   disable mem-arena prefetch loop in autoloops mode\n");
+    fprintf(stderr, "  --arena-disable-bg-compress disable mem-arena background compression loop in autoloops mode\n");
     fprintf(stderr, "  --controller-enroll        enroll with workload controller (requires mem-arena)\n");
     fprintf(stderr, "  --controller-sock <path>   controller unix datagram socket path\n");
     fprintf(stderr, "  --compress-policy <mode>   internal|external|both (default internal)\n");
@@ -153,6 +159,12 @@ int main(int argc, char **argv)
     int arena_cap_mb = 256;
     int arena_min_savings_pct = 5;
     const char *arena_stats_json = NULL;
+    int arena_autoloops = 0;
+    int arena_t_cold_ms = 2000;
+    int arena_prefetch_distance = 1;
+    int arena_prefetch_batch = 4;
+    int arena_disable_prefetch = 0;
+    int arena_disable_bg_compress = 0;
     int controller_enroll = 0;
     const char *controller_sock = NULL;
     enum compress_policy compress_policy = COMPRESS_POLICY_INTERNAL;
@@ -186,6 +198,18 @@ int main(int argc, char **argv)
             controller_enroll = 1;
             continue;
         }
+        if (strcmp(argv[i], "--arena-autoloops") == 0) {
+            arena_autoloops = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--arena-disable-prefetch") == 0) {
+            arena_disable_prefetch = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--arena-disable-bg-compress") == 0) {
+            arena_disable_bg_compress = 1;
+            continue;
+        }
         if (i + 1 >= argc) {
             fprintf(stderr, "missing value for %s\n", argv[i]);
             return 2;
@@ -212,6 +236,18 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--arena-stats-json") == 0) {
             arena_stats_json = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--arena-t-cold-ms") == 0) {
+            arena_t_cold_ms = wl_parse_int_arg("--arena-t-cold-ms", argv[++i], 100, 60000);
+            continue;
+        }
+        if (strcmp(argv[i], "--arena-prefetch-distance") == 0) {
+            arena_prefetch_distance = wl_parse_int_arg("--arena-prefetch-distance", argv[++i], 1, 1024);
+            continue;
+        }
+        if (strcmp(argv[i], "--arena-prefetch-batch") == 0) {
+            arena_prefetch_batch = wl_parse_int_arg("--arena-prefetch-batch", argv[++i], 1, 1024);
             continue;
         }
         if (strcmp(argv[i], "--controller-sock") == 0) {
@@ -267,6 +303,43 @@ int main(int argc, char **argv)
             fprintf(stderr, "mem_arena_region_alloc failed\n");
             mem_arena_destroy(arena);
             return 1;
+        }
+        if (arena_autoloops) {
+            struct mem_arena_loops_config loops_cfg = {0};
+
+            loops_cfg.enable_hotness_loop = 1;
+            loops_cfg.enable_compression_loop = arena_disable_bg_compress ? 0 : 1;
+            loops_cfg.enable_prefetch_loop = arena_disable_prefetch ? 0 : 1;
+            loops_cfg.enable_touch_sampling = 1;
+            loops_cfg.hotness_tick_ms = 50;
+            loops_cfg.sampling_tick_ms = 200;
+            loops_cfg.compression_tick_ms = 100;
+            loops_cfg.prefetch_tick_ms = 50;
+            loops_cfg.sampling_budget_pages = 64;
+            loops_cfg.t_hot_epochs = 2;
+            loops_cfg.t_cold_epochs_initial = (uint32_t)((arena_t_cold_ms + 99) / 100);
+            if (loops_cfg.t_cold_epochs_initial < 2) {
+                loops_cfg.t_cold_epochs_initial = 2;
+            }
+            loops_cfg.t_cold_epochs_min = 2;
+            loops_cfg.t_cold_epochs_max = 600;
+            loops_cfg.t_cold_step_up = 2;
+            loops_cfg.t_cold_step_down = 1;
+            loops_cfg.recompress_guard_epochs = 3;
+            loops_cfg.churn_touch_threshold = 100000;
+            loops_cfg.low_ratio_skip_bps = 9000;
+            loops_cfg.prefetch_distance_chunks = (uint32_t)arena_prefetch_distance;
+            loops_cfg.prefetch_batch_chunks = (uint32_t)arena_prefetch_batch;
+            loops_cfg.prefetch_queue_capacity = 1024;
+            loops_cfg.adapt_interval_ms = 1000;
+            loops_cfg.target_pool_util_pct = 70;
+            loops_cfg.stall_events_threshold = 8;
+
+            if (mem_arena_loops_start(arena, &loops_cfg) != 0) {
+                fprintf(stderr, "mem_arena_loops_start failed\n");
+                mem_arena_destroy(arena);
+                return 1;
+            }
         }
         if (controller_enroll) {
             if (wl_controller_send_enroll(controller_sock,
@@ -335,6 +408,10 @@ int main(int argc, char **argv)
             return 1;
         }
 
+        if (use_mem_arena && arena_autoloops) {
+            (void)mem_arena_phase_hint(arena, region_id, "active_soon");
+            (void)mem_arena_prefetch_range(arena, region_id, 0, (size_t)arena_prefetch_batch * PAGE_SIZE);
+        }
         wl_sleep_ns((uint64_t)idle_ms * 1000000ULL);
 
         if (use_mem_arena && maybe_external_compress(arena,
@@ -371,17 +448,26 @@ int main(int argc, char **argv)
         wl_print_json_kv_u64("touches", touches, false);
         wl_print_json_kv_u64("region_mb", (uint64_t)region_mb, false);
         wl_print_json_kv_u64("use_mem_arena", (uint64_t)use_mem_arena, false);
+        wl_print_json_kv_u64("arena_autoloops", (uint64_t)arena_autoloops, false);
         wl_print_json_kv_str("compress_policy", compress_policy_name(compress_policy), false);
         wl_print_json_kv_u64("external_compress_triggers", external_compress_triggers, false);
         if (use_mem_arena) {
             wl_print_json_kv_u64("arena_compress_ops", arena_stats.compress_ops, false);
             wl_print_json_kv_u64("arena_decompress_ops", arena_stats.decompress_ops, false);
             wl_print_json_kv_u64("arena_evictions_lru", arena_stats.evictions_lru, false);
+            wl_print_json_kv_u64("arena_hotness_epoch", arena_stats.hotness_epoch, false);
+            wl_print_json_kv_u64("arena_sampling_faults", arena_stats.sampling_faults_total, false);
+            wl_print_json_kv_u64("arena_bg_compress_attempts", arena_stats.bg_compress_attempts, false);
+            wl_print_json_kv_u64("arena_bg_compress_admits", arena_stats.bg_compress_admits, false);
+            wl_print_json_kv_u64("arena_prefetch_decompress_ops", arena_stats.prefetch_decompress_ops, false);
+            wl_print_json_kv_u64("arena_demand_decompress_stall_events", arena_stats.demand_decompress_stall_events, false);
+            wl_print_json_kv_u64("arena_demand_decompress_stall_ns_total", arena_stats.demand_decompress_stall_ns_total, false);
+            wl_print_json_kv_u64("arena_t_cold_epochs_current", arena_stats.adaptive_t_cold_epochs_current, false);
         }
         wl_print_json_kv_double("elapsed_ms", elapsed_ms, true);
         printf("}\n");
     } else {
-        printf("interactive_burst region_mb=%d active_ms=%d idle_ms=%d duration_sec=%d touches=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d compress_policy=%s external_compress_triggers=%" PRIu64,
+        printf("interactive_burst region_mb=%d active_ms=%d idle_ms=%d duration_sec=%d touches=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d arena_autoloops=%d compress_policy=%s external_compress_triggers=%" PRIu64,
                region_mb,
                active_ms,
                idle_ms,
@@ -389,18 +475,31 @@ int main(int argc, char **argv)
                touches,
                elapsed_ms,
                use_mem_arena,
+               arena_autoloops,
                compress_policy_name(compress_policy),
                external_compress_triggers);
         if (use_mem_arena) {
-            printf(" arena_compress_ops=%" PRIu64 " arena_decompress_ops=%" PRIu64 " arena_evictions_lru=%" PRIu64,
+            printf(" arena_compress_ops=%" PRIu64 " arena_decompress_ops=%" PRIu64 " arena_evictions_lru=%" PRIu64
+                   " arena_hotness_epoch=%" PRIu64 " arena_sampling_faults=%" PRIu64 " arena_bg_compress_attempts=%" PRIu64
+                   " arena_bg_compress_admits=%" PRIu64 " arena_prefetch_decompress_ops=%" PRIu64
+                   " arena_demand_decomp_stalls=%" PRIu64,
                    arena_stats.compress_ops,
                    arena_stats.decompress_ops,
-                   arena_stats.evictions_lru);
+                   arena_stats.evictions_lru,
+                   arena_stats.hotness_epoch,
+                   arena_stats.sampling_faults_total,
+                   arena_stats.bg_compress_attempts,
+                   arena_stats.bg_compress_admits,
+                   arena_stats.prefetch_decompress_ops,
+                   arena_stats.demand_decompress_stall_events);
         }
         printf("\n");
     }
 
     if (use_mem_arena) {
+        if (arena_autoloops) {
+            (void)mem_arena_loops_stop(arena);
+        }
         if (arena_stats_json != NULL) {
             if (write_arena_stats_json(arena_stats_json, "interactive_burst", &arena_stats) != 0) {
                 mem_arena_destroy(arena);

@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -g -Wall -Wextra
+CFLAGS ?= -O2 -g -Wall -Wextra -D_GNU_SOURCE
 AR ?= ar
 ARFLAGS ?= rcs
 
@@ -29,10 +29,10 @@ $(LIB): $(LIB_OBJS)
 	$(AR) $(ARFLAGS) $@ $^
 
 $(DEMO): $(EXAMPLE_DIR)/arena_demo.c $(LIB)
-	$(CC) $(CFLAGS) -I$(INCLUDE_DIR) $< -L. -lmemarena -llz4 -o $@
+	$(CC) $(CFLAGS) -I$(INCLUDE_DIR) $< -L. -lmemarena -llz4 -pthread -o $@
 
 $(PROCESS_BENCH): $(TOOL_DIR)/process_mem_bench.c $(LIB)
-	$(CC) $(CFLAGS) -I$(INCLUDE_DIR) $< -L. -lmemarena -llz4 -o $@
+	$(CC) $(CFLAGS) -I$(INCLUDE_DIR) $< -L. -lmemarena -llz4 -pthread -o $@
 
 demo: $(DEMO)
 	./$(DEMO)

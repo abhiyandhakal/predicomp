@@ -3,21 +3,44 @@
 #include "mem_arena_codec.h"
 
 #include <errno.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
 
 #define MEM_ARENA_MAX_REGIONS 64
 #define MEM_ARENA_POOL_ALIGN 8U
+#define MEM_ARENA_SAMPLER_FAULT_RING_CAP 4096
+
+enum mem_arena_temp_state {
+    MEM_ARENA_STATE_HOT = 0,
+    MEM_ARENA_STATE_WARM = 1,
+    MEM_ARENA_STATE_COLD = 2,
+};
 
 struct mem_arena_chunk {
     int compressed;
     size_t pool_off;
     int comp_len;
     uint64_t tick;
+    uint64_t last_touch_epoch;
+    uint64_t last_compress_epoch;
+    uint64_t last_decompress_epoch;
+    uint32_t touch_count_total;
+    uint32_t touch_count_window;
+    uint32_t sampled_fault_hits_window;
+    uint16_t last_comp_ratio_bps;
+    uint8_t temp_state;
+    uint8_t sampling_armed;
+    uint8_t prefetch_queued;
+    uint8_t reserved0;
 };
 
 struct mem_arena_region {
@@ -28,12 +51,25 @@ struct mem_arena_region {
     size_t alloc_bytes;
     size_t chunk_count;
     struct mem_arena_chunk *chunks;
+    size_t last_touch_chunk_idx;
+    long last_stride;
+    uint32_t stride_run_len;
 };
 
 struct mem_arena_extent {
     size_t off;
     size_t len;
     struct mem_arena_extent *next;
+};
+
+struct mem_arena_fault_record {
+    uintptr_t addr;
+};
+
+struct mem_arena_prefetch_item {
+    int region_id;
+    size_t chunk_idx;
+    uint8_t reason;
 };
 
 struct mem_arena {
@@ -44,6 +80,28 @@ struct mem_arena {
     struct mem_arena_region regions[MEM_ARENA_MAX_REGIONS];
     struct mem_arena_stats stats;
     uint64_t tick;
+    uint64_t epoch;
+    pthread_mutex_t mu;
+    int mu_init;
+    long page_size;
+    struct mem_arena_loops_config loops_cfg;
+    int loops_running;
+    int stop_threads;
+    pthread_t hotness_thread;
+    pthread_t compression_thread;
+    pthread_t prefetch_thread;
+    uint64_t next_sampling_epoch;
+    uint64_t next_adapt_ns;
+    struct mem_arena_prefetch_item *prefetch_q;
+    size_t prefetch_q_cap;
+    size_t prefetch_q_head;
+    size_t prefetch_q_len;
+    atomic_size_t fault_ring_write_idx;
+    atomic_size_t fault_ring_read_idx;
+    struct mem_arena_fault_record fault_ring[MEM_ARENA_SAMPLER_FAULT_RING_CAP];
+    stack_t segv_altstack;
+    int segv_altstack_installed;
+    int owns_segv_handler;
 };
 
 struct live_chunk_ref {
@@ -52,6 +110,283 @@ struct live_chunk_ref {
     size_t off;
     size_t len;
 };
+
+static pthread_mutex_t g_sampler_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_uintptr_t g_sampler_arena_ptr;
+static struct sigaction g_prev_segv_act;
+static int g_prev_segv_act_valid;
+
+int mem_arena_loops_stop(struct mem_arena *arena);
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void sleep_ms(uint32_t ms)
+{
+    struct timespec req;
+
+    req.tv_sec = (time_t)(ms / 1000U);
+    req.tv_nsec = (long)((ms % 1000U) * 1000000UL);
+    nanosleep(&req, NULL);
+}
+
+static void mem_arena_lock(struct mem_arena *arena)
+{
+    if (arena != NULL && arena->mu_init) {
+        pthread_mutex_lock(&arena->mu);
+    }
+}
+
+static void mem_arena_unlock(struct mem_arena *arena)
+{
+    if (arena != NULL && arena->mu_init) {
+        pthread_mutex_unlock(&arena->mu);
+    }
+}
+
+static struct mem_arena_loops_config default_loops_config(void)
+{
+    struct mem_arena_loops_config cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enable_hotness_loop = 1;
+    cfg.enable_compression_loop = 1;
+    cfg.enable_prefetch_loop = 1;
+    cfg.enable_touch_sampling = 1;
+    cfg.hotness_tick_ms = 100;
+    cfg.sampling_tick_ms = 200;
+    cfg.compression_tick_ms = 100;
+    cfg.prefetch_tick_ms = 50;
+    cfg.sampling_budget_pages = 16;
+    cfg.t_hot_epochs = 5;
+    cfg.t_cold_epochs_initial = 20;
+    cfg.t_cold_epochs_min = 5;
+    cfg.t_cold_epochs_max = 200;
+    cfg.t_cold_step_up = 2;
+    cfg.t_cold_step_down = 1;
+    cfg.recompress_guard_epochs = 3;
+    cfg.churn_touch_threshold = 8;
+    cfg.low_ratio_skip_bps = 9000;
+    cfg.prefetch_distance_chunks = 1;
+    cfg.prefetch_batch_chunks = 4;
+    cfg.prefetch_queue_capacity = 1024;
+    cfg.adapt_interval_ms = 1000;
+    cfg.target_pool_util_pct = 70;
+    cfg.stall_events_threshold = 8;
+    return cfg;
+}
+
+static int prefetch_queue_push(struct mem_arena *arena, int region_id, size_t chunk_idx, uint8_t reason)
+{
+    size_t tail;
+    struct mem_arena_region *region;
+    struct mem_arena_chunk *chunk;
+
+    if (arena == NULL || region_id < 0 || region_id >= MEM_ARENA_MAX_REGIONS) {
+        return -1;
+    }
+    region = &arena->regions[region_id];
+    if (!region->in_use || chunk_idx >= region->chunk_count) {
+        return -1;
+    }
+    chunk = &region->chunks[chunk_idx];
+    if (!chunk->compressed) {
+        return 0;
+    }
+    if (chunk->prefetch_queued) {
+        arena->stats.prefetch_queue_dedup_skips++;
+        return 0;
+    }
+    if (arena->prefetch_q_cap == 0 || arena->prefetch_q_len >= arena->prefetch_q_cap) {
+        arena->stats.prefetch_queue_dedup_skips++;
+        return 0;
+    }
+
+    tail = (arena->prefetch_q_head + arena->prefetch_q_len) % arena->prefetch_q_cap;
+    arena->prefetch_q[tail].region_id = region_id;
+    arena->prefetch_q[tail].chunk_idx = chunk_idx;
+    arena->prefetch_q[tail].reason = reason;
+    arena->prefetch_q_len++;
+    chunk->prefetch_queued = 1;
+    arena->stats.prefetch_queue_enqueues++;
+    return 0;
+}
+
+static int prefetch_queue_pop(struct mem_arena *arena, struct mem_arena_prefetch_item *out_item)
+{
+    if (arena == NULL || out_item == NULL || arena->prefetch_q_len == 0) {
+        return 1;
+    }
+    *out_item = arena->prefetch_q[arena->prefetch_q_head];
+    arena->prefetch_q_head = (arena->prefetch_q_head + 1) % arena->prefetch_q_cap;
+    arena->prefetch_q_len--;
+    return 0;
+}
+
+static int fault_ring_push(struct mem_arena *arena, uintptr_t addr)
+{
+    size_t wr;
+    size_t rd;
+    size_t next;
+
+    if (arena == NULL) {
+        return -1;
+    }
+
+    wr = atomic_load_explicit(&arena->fault_ring_write_idx, memory_order_relaxed);
+    rd = atomic_load_explicit(&arena->fault_ring_read_idx, memory_order_acquire);
+    next = (wr + 1U) % MEM_ARENA_SAMPLER_FAULT_RING_CAP;
+    if (next == rd) {
+        return 1;
+    }
+    arena->fault_ring[wr].addr = addr;
+    atomic_store_explicit(&arena->fault_ring_write_idx, next, memory_order_release);
+    return 0;
+}
+
+static int fault_ring_pop(struct mem_arena *arena, struct mem_arena_fault_record *out_rec)
+{
+    size_t rd;
+    size_t wr;
+
+    if (arena == NULL || out_rec == NULL) {
+        return -1;
+    }
+
+    rd = atomic_load_explicit(&arena->fault_ring_read_idx, memory_order_relaxed);
+    wr = atomic_load_explicit(&arena->fault_ring_write_idx, memory_order_acquire);
+    if (rd == wr) {
+        return 1;
+    }
+
+    *out_rec = arena->fault_ring[rd];
+    rd = (rd + 1U) % MEM_ARENA_SAMPLER_FAULT_RING_CAP;
+    atomic_store_explicit(&arena->fault_ring_read_idx, rd, memory_order_release);
+    return 0;
+}
+
+static void mem_arena_segv_handler(int signo, siginfo_t *si, void *ucontext)
+{
+    struct mem_arena *arena;
+    uintptr_t fault_addr;
+    int handled = 0;
+
+    (void)ucontext;
+
+    arena = (struct mem_arena *)atomic_load_explicit(&g_sampler_arena_ptr, memory_order_acquire);
+
+    if (arena != NULL && si != NULL && si->si_addr != NULL) {
+        fault_addr = (uintptr_t)si->si_addr;
+        for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
+            struct mem_arena_region *r = &arena->regions[i];
+            uintptr_t start;
+            uintptr_t end;
+
+            if (!r->in_use || r->raw == NULL) {
+                continue;
+            }
+            start = (uintptr_t)r->raw;
+            end = start + r->alloc_bytes;
+            if (fault_addr < start || fault_addr >= end) {
+                continue;
+            }
+
+            if (arena->page_size > 0) {
+                uintptr_t page = fault_addr & ~((uintptr_t)arena->page_size - 1U);
+                (void)mprotect((void *)page, (size_t)arena->page_size, PROT_READ | PROT_WRITE);
+            }
+            if (fault_ring_push(arena, fault_addr) != 0) {
+                arena->stats.sampling_faults_dropped++;
+            }
+            handled = 1;
+            break;
+        }
+    }
+
+    if (handled) {
+        return;
+    }
+
+    signal(signo, SIG_DFL);
+    raise(signo);
+}
+
+static int install_sampler_handler(struct mem_arena *arena)
+{
+    struct sigaction act;
+
+    if (arena == NULL) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_sampler_mu);
+    if ((struct mem_arena *)atomic_load_explicit(&g_sampler_arena_ptr, memory_order_acquire) != NULL &&
+        (struct mem_arena *)atomic_load_explicit(&g_sampler_arena_ptr, memory_order_acquire) != arena) {
+        pthread_mutex_unlock(&g_sampler_mu);
+        return -1;
+    }
+    if (!arena->segv_altstack_installed) {
+        arena->segv_altstack.ss_size = SIGSTKSZ * 2U;
+        arena->segv_altstack.ss_sp = malloc(arena->segv_altstack.ss_size);
+        arena->segv_altstack.ss_flags = 0;
+        if (arena->segv_altstack.ss_sp == NULL) {
+            pthread_mutex_unlock(&g_sampler_mu);
+            return -1;
+        }
+        if (sigaltstack(&arena->segv_altstack, NULL) != 0) {
+            free(arena->segv_altstack.ss_sp);
+            memset(&arena->segv_altstack, 0, sizeof(arena->segv_altstack));
+            pthread_mutex_unlock(&g_sampler_mu);
+            return -1;
+        }
+        arena->segv_altstack_installed = 1;
+    }
+
+    memset(&act, 0, sizeof(act));
+    act.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    act.sa_sigaction = mem_arena_segv_handler;
+    sigemptyset(&act.sa_mask);
+    if (!g_prev_segv_act_valid) {
+        if (sigaction(SIGSEGV, &act, &g_prev_segv_act) != 0) {
+            pthread_mutex_unlock(&g_sampler_mu);
+            return -1;
+        }
+        g_prev_segv_act_valid = 1;
+    } else {
+        if (sigaction(SIGSEGV, &act, NULL) != 0) {
+            pthread_mutex_unlock(&g_sampler_mu);
+            return -1;
+        }
+    }
+    atomic_store_explicit(&g_sampler_arena_ptr, (uintptr_t)arena, memory_order_release);
+    arena->owns_segv_handler = 1;
+    pthread_mutex_unlock(&g_sampler_mu);
+    return 0;
+}
+
+static void uninstall_sampler_handler(struct mem_arena *arena)
+{
+    if (arena == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_sampler_mu);
+    if ((struct mem_arena *)atomic_load_explicit(&g_sampler_arena_ptr, memory_order_acquire) == arena) {
+        atomic_store_explicit(&g_sampler_arena_ptr, (uintptr_t)NULL, memory_order_release);
+        if (g_prev_segv_act_valid) {
+            (void)sigaction(SIGSEGV, &g_prev_segv_act, NULL);
+            g_prev_segv_act_valid = 0;
+            memset(&g_prev_segv_act, 0, sizeof(g_prev_segv_act));
+        }
+    }
+    arena->owns_segv_handler = 0;
+    pthread_mutex_unlock(&g_sampler_mu);
+}
 
 static size_t align_up(size_t value, size_t align)
 {
@@ -234,6 +569,8 @@ static int free_chunk_extent(struct mem_arena *arena, struct mem_arena_chunk *ch
     chunk->pool_off = (size_t)-1;
     chunk->comp_len = 0;
     chunk->tick = ++arena->tick;
+    chunk->sampling_armed = 0;
+    chunk->prefetch_queued = 0;
 
     refresh_pool_stats(arena);
     return 0;
@@ -372,6 +709,10 @@ static int decompress_chunk(struct mem_arena *arena, int region_id, size_t chunk
 
     arena->stats.decompress_ops++;
     arena->stats.access_hits_decompressed++;
+    chunk->last_decompress_epoch = arena->epoch;
+    chunk->sampled_fault_hits_window = 0;
+    chunk->touch_count_window++;
+    chunk->temp_state = MEM_ARENA_STATE_HOT;
 
     if (free_chunk_extent(arena, chunk) != 0) {
         return -1;
@@ -516,6 +857,10 @@ static int compress_chunk(struct mem_arena *arena, int region_id, size_t chunk_i
     chunk->pool_off = off;
     chunk->comp_len = out_size;
     chunk->tick = ++arena->tick;
+    chunk->last_compress_epoch = arena->epoch;
+    chunk->last_comp_ratio_bps = (uint16_t)(((uint64_t)out_size * 10000ULL) / arena->cfg.chunk_size);
+    chunk->temp_state = MEM_ARENA_STATE_COLD;
+    chunk->prefetch_queued = 0;
 
     arena->stats.chunks_admitted++;
     arena->stats.compress_ops++;
@@ -543,6 +888,17 @@ struct mem_arena *mem_arena_create(const struct mem_arena_config *cfg)
     if (arena == NULL) {
         return NULL;
     }
+    arena->page_size = sysconf(_SC_PAGESIZE);
+    if (arena->page_size <= 0) {
+        arena->page_size = 4096;
+    }
+    atomic_init(&arena->fault_ring_write_idx, 0);
+    atomic_init(&arena->fault_ring_read_idx, 0);
+    if (pthread_mutex_init(&arena->mu, NULL) != 0) {
+        free(arena);
+        return NULL;
+    }
+    arena->mu_init = 1;
 
     arena->cfg = *cfg;
     if (arena->cfg.lz4_acceleration <= 0) {
@@ -579,6 +935,8 @@ void mem_arena_destroy(struct mem_arena *arena)
         return;
     }
 
+    (void)mem_arena_loops_stop(arena);
+
     for (i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
         if (!arena->regions[i].in_use) {
             continue;
@@ -590,7 +948,18 @@ void mem_arena_destroy(struct mem_arena *arena)
     }
 
     free_extent_list(arena->free_extents);
+    if (arena->segv_altstack_installed) {
+        stack_t disable_stack;
+        memset(&disable_stack, 0, sizeof(disable_stack));
+        disable_stack.ss_flags = SS_DISABLE;
+        (void)sigaltstack(&disable_stack, NULL);
+        free(arena->segv_altstack.ss_sp);
+    }
+    free(arena->prefetch_q);
     free(arena->pool);
+    if (arena->mu_init) {
+        pthread_mutex_destroy(&arena->mu);
+    }
     free(arena);
 }
 
@@ -611,6 +980,7 @@ int mem_arena_region_alloc(
     if (arena == NULL || out_region_id == NULL || out_raw == NULL || bytes == 0) {
         return -1;
     }
+    mem_arena_lock(arena);
 
     alloc_bytes = align_up(bytes, arena->cfg.chunk_size);
     chunk_count = alloc_bytes / arena->cfg.chunk_size;
@@ -621,17 +991,20 @@ int mem_arena_region_alloc(
         }
     }
     if (i == MEM_ARENA_MAX_REGIONS) {
+        mem_arena_unlock(arena);
         return -1;
     }
 
     raw = mmap(NULL, alloc_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) {
+        mem_arena_unlock(arena);
         return -1;
     }
 
     chunks = calloc(chunk_count, sizeof(*chunks));
     if (chunks == NULL) {
         munmap(raw, alloc_bytes);
+        mem_arena_unlock(arena);
         return -1;
     }
 
@@ -640,6 +1013,7 @@ int mem_arena_region_alloc(
         chunks[idx].pool_off = (size_t)-1;
         chunks[idx].comp_len = 0;
         chunks[idx].tick = 0;
+        chunks[idx].temp_state = MEM_ARENA_STATE_HOT;
     }
 
     arena->regions[i].in_use = 1;
@@ -648,6 +1022,9 @@ int mem_arena_region_alloc(
     arena->regions[i].alloc_bytes = alloc_bytes;
     arena->regions[i].chunk_count = chunk_count;
     arena->regions[i].chunks = chunks;
+    arena->regions[i].last_touch_chunk_idx = 0;
+    arena->regions[i].last_stride = 0;
+    arena->regions[i].stride_run_len = 0;
     if (name != NULL) {
         snprintf(arena->regions[i].name, sizeof(arena->regions[i].name), "%s", name);
     } else {
@@ -656,6 +1033,7 @@ int mem_arena_region_alloc(
 
     *out_region_id = i;
     *out_raw = raw;
+    mem_arena_unlock(arena);
     return 0;
 }
 
@@ -663,7 +1041,9 @@ int mem_arena_region_free(struct mem_arena *arena, int region_id)
 {
     struct mem_arena_region *region;
 
+    mem_arena_lock(arena);
     if (validate_region_id(arena, region_id) != 0) {
+        mem_arena_unlock(arena);
         return -1;
     }
 
@@ -676,6 +1056,7 @@ int mem_arena_region_free(struct mem_arena *arena, int region_id)
             continue;
         }
         if (free_chunk_extent(arena, chunk) != 0) {
+            mem_arena_unlock(arena);
             return -1;
         }
     }
@@ -683,6 +1064,7 @@ int mem_arena_region_free(struct mem_arena *arena, int region_id)
     munmap(region->raw, region->alloc_bytes);
     free(region->chunks);
     memset(region, 0, sizeof(*region));
+    mem_arena_unlock(arena);
 
     return 0;
 }
@@ -697,24 +1079,39 @@ int mem_arena_touch(
     struct mem_arena_region *region;
     size_t chunk_idx;
     unsigned char *ptr;
+    struct mem_arena_chunk *chunk;
+    uint64_t stall_start_ns = 0;
+    uint64_t stall_end_ns = 0;
+    size_t prev_chunk_idx;
+    long stride;
 
+    mem_arena_lock(arena);
     if (validate_region_id(arena, region_id) != 0) {
+        mem_arena_unlock(arena);
         return -1;
     }
     region = &arena->regions[region_id];
 
     if (offset >= region->bytes) {
+        mem_arena_unlock(arena);
         return -1;
     }
 
     chunk_idx = offset / arena->cfg.chunk_size;
-    if (region->chunks[chunk_idx].compressed) {
+    chunk = &region->chunks[chunk_idx];
+
+    if (chunk->compressed) {
+        stall_start_ns = monotonic_ns();
         if (decompress_chunk(arena, region_id, chunk_idx) != 0) {
+            mem_arena_unlock(arena);
             return -1;
         }
+        stall_end_ns = monotonic_ns();
+        arena->stats.demand_decompress_stall_events++;
+        arena->stats.demand_decompress_stall_ns_total += (stall_end_ns - stall_start_ns);
     } else {
         arena->stats.access_hits_raw++;
-        region->chunks[chunk_idx].tick = ++arena->tick;
+        chunk->tick = ++arena->tick;
     }
 
     ptr = region->raw + offset;
@@ -723,8 +1120,44 @@ int mem_arena_touch(
     } else if (op_kind == MEM_ARENA_OP_XOR1) {
         (*ptr) ^= 1;
     } else {
+        mem_arena_unlock(arena);
         return -1;
     }
+
+    chunk = &region->chunks[chunk_idx];
+    chunk->last_touch_epoch = arena->epoch;
+    chunk->touch_count_total++;
+    chunk->touch_count_window++;
+    chunk->temp_state = MEM_ARENA_STATE_HOT;
+    chunk->tick = ++arena->tick;
+
+    prev_chunk_idx = region->last_touch_chunk_idx;
+    stride = (long)chunk_idx - (long)prev_chunk_idx;
+    if (region->stride_run_len == 0) {
+        region->last_stride = stride;
+        region->stride_run_len = 1;
+    } else if (stride == region->last_stride) {
+        region->stride_run_len++;
+    } else {
+        region->last_stride = stride;
+        region->stride_run_len = 1;
+    }
+    region->last_touch_chunk_idx = chunk_idx;
+
+    if (arena->loops_running &&
+        arena->loops_cfg.enable_prefetch_loop &&
+        region->stride_run_len >= 3 &&
+        region->last_stride == 1) {
+        for (uint32_t i = 0; i < arena->loops_cfg.prefetch_batch_chunks; i++) {
+            size_t next_idx = chunk_idx + arena->loops_cfg.prefetch_distance_chunks + i;
+            if (next_idx >= region->chunk_count) {
+                break;
+            }
+            (void)prefetch_queue_push(arena, region_id, next_idx, 1);
+        }
+    }
+
+    mem_arena_unlock(arena);
 
     return 0;
 }
@@ -733,17 +1166,528 @@ int mem_arena_compress_region(struct mem_arena *arena, int region_id)
 {
     struct mem_arena_region *region;
 
+    mem_arena_lock(arena);
     if (validate_region_id(arena, region_id) != 0) {
+        mem_arena_unlock(arena);
         return -1;
     }
 
     region = &arena->regions[region_id];
     for (size_t idx = 0; idx < region->chunk_count; idx++) {
         if (compress_chunk(arena, region_id, idx) != 0) {
+            mem_arena_unlock(arena);
             return -1;
         }
     }
+    mem_arena_unlock(arena);
 
+    return 0;
+}
+
+static void update_chunk_temp_states_locked(struct mem_arena *arena)
+{
+    uint64_t hot = 0;
+    uint64_t warm = 0;
+    uint64_t cold = 0;
+    uint64_t epoch = arena->epoch;
+    uint32_t t_hot = arena->loops_cfg.t_hot_epochs;
+    uint32_t t_cold = (uint32_t)arena->stats.adaptive_t_cold_epochs_current;
+
+    for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
+        struct mem_arena_region *r = &arena->regions[i];
+
+        if (!r->in_use) {
+            continue;
+        }
+        for (size_t j = 0; j < r->chunk_count; j++) {
+            struct mem_arena_chunk *c = &r->chunks[j];
+            uint64_t age = (epoch >= c->last_touch_epoch) ? (epoch - c->last_touch_epoch) : 0;
+
+            if (age <= t_hot) {
+                c->temp_state = MEM_ARENA_STATE_HOT;
+                hot++;
+            } else if (age >= t_cold) {
+                c->temp_state = MEM_ARENA_STATE_COLD;
+                cold++;
+            } else {
+                c->temp_state = MEM_ARENA_STATE_WARM;
+                warm++;
+            }
+        }
+    }
+
+    arena->stats.chunks_hot = hot;
+    arena->stats.chunks_warm = warm;
+    arena->stats.chunks_cold = cold;
+}
+
+static void decay_touch_windows_locked(struct mem_arena *arena)
+{
+    for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
+        struct mem_arena_region *r = &arena->regions[i];
+
+        if (!r->in_use) {
+            continue;
+        }
+        for (size_t j = 0; j < r->chunk_count; j++) {
+            struct mem_arena_chunk *c = &r->chunks[j];
+
+            c->touch_count_window /= 2U;
+            c->sampled_fault_hits_window /= 2U;
+        }
+    }
+}
+
+static void drain_sampling_faults_locked(struct mem_arena *arena)
+{
+    struct mem_arena_fault_record rec;
+
+    while (fault_ring_pop(arena, &rec) == 0) {
+        uintptr_t addr = rec.addr;
+
+        arena->stats.sampling_faults_total++;
+        for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
+            struct mem_arena_region *r = &arena->regions[i];
+            uintptr_t start;
+            uintptr_t end;
+            size_t page_off;
+            size_t chunk_idx;
+            struct mem_arena_chunk *c;
+
+            if (!r->in_use || r->raw == NULL) {
+                continue;
+            }
+            start = (uintptr_t)r->raw;
+            end = start + r->alloc_bytes;
+            if (addr < start || addr >= end) {
+                continue;
+            }
+
+            page_off = (size_t)(addr - start);
+            chunk_idx = page_off / arena->cfg.chunk_size;
+            if (chunk_idx >= r->chunk_count) {
+                break;
+            }
+            c = &r->chunks[chunk_idx];
+            c->sampling_armed = 0;
+            c->sampled_fault_hits_window++;
+            c->last_touch_epoch = arena->epoch;
+            c->temp_state = MEM_ARENA_STATE_HOT;
+            if (arena->stats.sampling_pages_armed > 0) {
+                arena->stats.sampling_pages_armed--;
+            }
+            break;
+        }
+    }
+}
+
+static void arm_sampling_pages_locked(struct mem_arena *arena)
+{
+    uint32_t budget;
+
+    if (!arena->loops_cfg.enable_touch_sampling || arena->page_size <= 0) {
+        return;
+    }
+    if ((size_t)arena->cfg.chunk_size != (size_t)arena->page_size) {
+        return;
+    }
+    if (arena->epoch < arena->next_sampling_epoch) {
+        return;
+    }
+    budget = arena->loops_cfg.sampling_budget_pages;
+    if (budget == 0) {
+        budget = 1;
+    }
+    arena->next_sampling_epoch = arena->epoch + 1;
+
+    for (int i = 0; i < MEM_ARENA_MAX_REGIONS && budget > 0; i++) {
+        struct mem_arena_region *r = &arena->regions[i];
+
+        if (!r->in_use) {
+            continue;
+        }
+        for (size_t j = 0; j < r->chunk_count && budget > 0; j++) {
+            struct mem_arena_chunk *c = &r->chunks[j];
+            uint64_t age = (arena->epoch >= c->last_touch_epoch) ? (arena->epoch - c->last_touch_epoch) : 0;
+            void *page_addr;
+
+            if (c->compressed || c->sampling_armed) {
+                continue;
+            }
+            if (c->temp_state == MEM_ARENA_STATE_HOT && age <= 1) {
+                continue;
+            }
+            page_addr = r->raw + (j * arena->cfg.chunk_size);
+            if (mprotect(page_addr, (size_t)arena->page_size, PROT_NONE) == 0) {
+                c->sampling_armed = 1;
+                arena->stats.sampling_pages_armed++;
+                budget--;
+            }
+        }
+    }
+}
+
+static void adapt_t_cold_locked(struct mem_arena *arena)
+{
+    uint64_t now_ns;
+    uint32_t cur;
+    uint64_t stalls;
+    uint64_t pool_util_pct = 0;
+
+    if (arena->loops_cfg.adapt_interval_ms == 0) {
+        return;
+    }
+    now_ns = monotonic_ns();
+    if (arena->next_adapt_ns != 0 && now_ns < arena->next_adapt_ns) {
+        return;
+    }
+    arena->next_adapt_ns = now_ns + ((uint64_t)arena->loops_cfg.adapt_interval_ms * 1000000ULL);
+
+    cur = (uint32_t)arena->stats.adaptive_t_cold_epochs_current;
+    if (cur == 0) {
+        cur = arena->loops_cfg.t_cold_epochs_initial;
+    }
+    stalls = arena->stats.demand_decompress_stall_events;
+    if (arena->pool_capacity_bytes > 0) {
+        pool_util_pct = (arena->stats.pool_bytes_live * 100ULL) / arena->pool_capacity_bytes;
+    }
+
+    if (stalls > arena->loops_cfg.stall_events_threshold) {
+        if (cur + arena->loops_cfg.t_cold_step_up <= arena->loops_cfg.t_cold_epochs_max) {
+            cur += arena->loops_cfg.t_cold_step_up;
+        } else {
+            cur = arena->loops_cfg.t_cold_epochs_max;
+        }
+        arena->stats.demand_decompress_stall_events = 0;
+        arena->stats.demand_decompress_stall_ns_total = 0;
+    } else if (pool_util_pct < arena->loops_cfg.target_pool_util_pct) {
+        if (cur > arena->loops_cfg.t_cold_epochs_min + arena->loops_cfg.t_cold_step_down) {
+            cur -= arena->loops_cfg.t_cold_step_down;
+        } else {
+            cur = arena->loops_cfg.t_cold_epochs_min;
+        }
+    }
+
+    if (cur < arena->loops_cfg.t_cold_epochs_min) {
+        cur = arena->loops_cfg.t_cold_epochs_min;
+    }
+    if (cur > arena->loops_cfg.t_cold_epochs_max) {
+        cur = arena->loops_cfg.t_cold_epochs_max;
+    }
+    arena->stats.adaptive_t_cold_epochs_current = cur;
+}
+
+static void *hotness_loop_main(void *arg)
+{
+    struct mem_arena *arena = (struct mem_arena *)arg;
+
+    while (!arena->stop_threads) {
+        mem_arena_lock(arena);
+        arena->epoch++;
+        arena->stats.hotness_epoch = arena->epoch;
+        drain_sampling_faults_locked(arena);
+        decay_touch_windows_locked(arena);
+        update_chunk_temp_states_locked(arena);
+        arm_sampling_pages_locked(arena);
+        mem_arena_unlock(arena);
+        sleep_ms(arena->loops_cfg.hotness_tick_ms ? arena->loops_cfg.hotness_tick_ms : 100);
+    }
+    return NULL;
+}
+
+static void *compression_loop_main(void *arg)
+{
+    struct mem_arena *arena = (struct mem_arena *)arg;
+
+    while (!arena->stop_threads) {
+        uint32_t compressed_this_tick = 0;
+        uint32_t max_per_tick = 128;
+
+        mem_arena_lock(arena);
+        update_chunk_temp_states_locked(arena);
+        adapt_t_cold_locked(arena);
+        for (int i = 0; i < MEM_ARENA_MAX_REGIONS && !arena->stop_threads; i++) {
+            struct mem_arena_region *r = &arena->regions[i];
+
+            if (!r->in_use) {
+                continue;
+            }
+            for (size_t j = 0; j < r->chunk_count; j++) {
+                struct mem_arena_chunk *c = &r->chunks[j];
+
+                if (compressed_this_tick >= max_per_tick) {
+                    break;
+                }
+                if (c->compressed) {
+                    continue;
+                }
+                if (c->temp_state != MEM_ARENA_STATE_COLD) {
+                    arena->stats.bg_compress_skipped_hot++;
+                    continue;
+                }
+                if (c->touch_count_window > arena->loops_cfg.churn_touch_threshold) {
+                    arena->stats.bg_compress_skipped_churn++;
+                    continue;
+                }
+                if (c->last_comp_ratio_bps != 0 && c->last_comp_ratio_bps > arena->loops_cfg.low_ratio_skip_bps) {
+                    arena->stats.bg_compress_skipped_low_ratio++;
+                    continue;
+                }
+                if (arena->epoch >= c->last_decompress_epoch &&
+                    (arena->epoch - c->last_decompress_epoch) < arena->loops_cfg.recompress_guard_epochs) {
+                    arena->stats.bg_compress_skipped_recent_decompress++;
+                    continue;
+                }
+
+                arena->stats.bg_compress_attempts++;
+                if (compress_chunk(arena, i, j) != 0) {
+                    continue;
+                }
+                if (r->chunks[j].compressed) {
+                    arena->stats.bg_compress_admits++;
+                    compressed_this_tick++;
+                }
+            }
+        }
+        mem_arena_unlock(arena);
+        sleep_ms(arena->loops_cfg.compression_tick_ms ? arena->loops_cfg.compression_tick_ms : 100);
+    }
+    return NULL;
+}
+
+static void *prefetch_loop_main(void *arg)
+{
+    struct mem_arena *arena = (struct mem_arena *)arg;
+
+    while (!arena->stop_threads) {
+        struct mem_arena_prefetch_item item;
+
+        mem_arena_lock(arena);
+        if (prefetch_queue_pop(arena, &item) == 0) {
+            if (validate_region_id(arena, item.region_id) == 0 &&
+                item.chunk_idx < arena->regions[item.region_id].chunk_count) {
+                struct mem_arena_chunk *c = &arena->regions[item.region_id].chunks[item.chunk_idx];
+
+                c->prefetch_queued = 0;
+                if (c->compressed && decompress_chunk(arena, item.region_id, item.chunk_idx) == 0) {
+                    arena->stats.prefetch_decompress_ops++;
+                }
+            }
+            mem_arena_unlock(arena);
+            continue;
+        }
+        mem_arena_unlock(arena);
+        sleep_ms(arena->loops_cfg.prefetch_tick_ms ? arena->loops_cfg.prefetch_tick_ms : 50);
+    }
+    return NULL;
+}
+
+int mem_arena_loops_start(struct mem_arena *arena, const struct mem_arena_loops_config *cfg)
+{
+    int rc = 0;
+
+    if (arena == NULL) {
+        return -1;
+    }
+
+    mem_arena_lock(arena);
+    if (arena->loops_running) {
+        mem_arena_unlock(arena);
+        return 0;
+    }
+    arena->loops_cfg = cfg != NULL ? *cfg : default_loops_config();
+    if (arena->loops_cfg.t_cold_epochs_initial == 0) {
+        arena->loops_cfg = default_loops_config();
+    }
+    arena->stats.adaptive_t_cold_epochs_current = arena->loops_cfg.t_cold_epochs_initial;
+    arena->stop_threads = 0;
+    arena->epoch = 0;
+    arena->stats.hotness_epoch = 0;
+    if (arena->loops_cfg.prefetch_queue_capacity == 0) {
+        arena->loops_cfg.prefetch_queue_capacity = 1024;
+    }
+    if (arena->prefetch_q_cap != arena->loops_cfg.prefetch_queue_capacity) {
+        free(arena->prefetch_q);
+        arena->prefetch_q = calloc(arena->loops_cfg.prefetch_queue_capacity, sizeof(*arena->prefetch_q));
+        if (arena->prefetch_q == NULL) {
+            arena->prefetch_q_cap = 0;
+            mem_arena_unlock(arena);
+            return -1;
+        }
+        arena->prefetch_q_cap = arena->loops_cfg.prefetch_queue_capacity;
+    }
+    arena->prefetch_q_head = 0;
+    arena->prefetch_q_len = 0;
+    atomic_store(&arena->fault_ring_write_idx, 0);
+    atomic_store(&arena->fault_ring_read_idx, 0);
+    arena->next_sampling_epoch = 0;
+    arena->next_adapt_ns = 0;
+    arena->loops_running = 1;
+    mem_arena_unlock(arena);
+
+    if (arena->loops_cfg.enable_touch_sampling) {
+        rc = install_sampler_handler(arena);
+        if (rc != 0) {
+            mem_arena_loops_stop(arena);
+            return -1;
+        }
+    }
+    if (arena->loops_cfg.enable_hotness_loop &&
+        pthread_create(&arena->hotness_thread, NULL, hotness_loop_main, arena) != 0) {
+        mem_arena_loops_stop(arena);
+        return -1;
+    }
+    if (arena->loops_cfg.enable_compression_loop &&
+        pthread_create(&arena->compression_thread, NULL, compression_loop_main, arena) != 0) {
+        mem_arena_loops_stop(arena);
+        return -1;
+    }
+    if (arena->loops_cfg.enable_prefetch_loop &&
+        pthread_create(&arena->prefetch_thread, NULL, prefetch_loop_main, arena) != 0) {
+        mem_arena_loops_stop(arena);
+        return -1;
+    }
+
+    return 0;
+}
+
+int mem_arena_loops_stop(struct mem_arena *arena)
+{
+    int hot_enabled;
+    int comp_enabled;
+    int pref_enabled;
+    pthread_t hot_t = 0;
+    pthread_t comp_t = 0;
+    pthread_t pref_t = 0;
+
+    if (arena == NULL) {
+        return -1;
+    }
+
+    mem_arena_lock(arena);
+    if (!arena->loops_running) {
+        mem_arena_unlock(arena);
+        return 0;
+    }
+    arena->stop_threads = 1;
+    hot_enabled = arena->loops_cfg.enable_hotness_loop;
+    comp_enabled = arena->loops_cfg.enable_compression_loop;
+    pref_enabled = arena->loops_cfg.enable_prefetch_loop;
+    hot_t = arena->hotness_thread;
+    comp_t = arena->compression_thread;
+    pref_t = arena->prefetch_thread;
+    arena->loops_running = 0;
+    mem_arena_unlock(arena);
+
+    if (hot_enabled) {
+        (void)pthread_join(hot_t, NULL);
+        arena->hotness_thread = (pthread_t)0;
+    }
+    if (comp_enabled) {
+        (void)pthread_join(comp_t, NULL);
+        arena->compression_thread = (pthread_t)0;
+    }
+    if (pref_enabled) {
+        (void)pthread_join(pref_t, NULL);
+        arena->prefetch_thread = (pthread_t)0;
+    }
+
+    if (arena->loops_cfg.enable_touch_sampling) {
+        mem_arena_lock(arena);
+        for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
+            struct mem_arena_region *r = &arena->regions[i];
+
+            if (!r->in_use || r->raw == NULL) {
+                continue;
+            }
+            if ((size_t)arena->cfg.chunk_size != (size_t)arena->page_size) {
+                continue;
+            }
+            for (size_t j = 0; j < r->chunk_count; j++) {
+                struct mem_arena_chunk *c = &r->chunks[j];
+                if (!c->sampling_armed) {
+                    continue;
+                }
+                (void)mprotect(r->raw + (j * arena->cfg.chunk_size),
+                               (size_t)arena->page_size,
+                               PROT_READ | PROT_WRITE);
+                c->sampling_armed = 0;
+            }
+        }
+        arena->stats.sampling_pages_armed = 0;
+        mem_arena_unlock(arena);
+        uninstall_sampler_handler(arena);
+    }
+
+    return 0;
+}
+
+int mem_arena_loops_is_running(struct mem_arena *arena, int *out_running)
+{
+    if (arena == NULL || out_running == NULL) {
+        return -1;
+    }
+    mem_arena_lock(arena);
+    *out_running = arena->loops_running;
+    mem_arena_unlock(arena);
+    return 0;
+}
+
+int mem_arena_prefetch_chunk(struct mem_arena *arena, int region_id, size_t offset)
+{
+    size_t chunk_idx;
+
+    if (arena == NULL) {
+        return -1;
+    }
+    mem_arena_lock(arena);
+    if (validate_region_id(arena, region_id) != 0) {
+        mem_arena_unlock(arena);
+        return -1;
+    }
+    if (offset >= arena->regions[region_id].bytes) {
+        mem_arena_unlock(arena);
+        return -1;
+    }
+    chunk_idx = offset / arena->cfg.chunk_size;
+    (void)prefetch_queue_push(arena, region_id, chunk_idx, 2);
+    mem_arena_unlock(arena);
+    return 0;
+}
+
+int mem_arena_prefetch_range(struct mem_arena *arena, int region_id, size_t start_offset, size_t length)
+{
+    if (arena == NULL || length == 0) {
+        return -1;
+    }
+    for (size_t off = start_offset; off < start_offset + length; off += arena->cfg.chunk_size) {
+        (void)mem_arena_prefetch_chunk(arena, region_id, off);
+        if (off + arena->cfg.chunk_size < off) {
+            break;
+        }
+    }
+    return 0;
+}
+
+int mem_arena_phase_hint(struct mem_arena *arena, int region_id, const char *phase_name)
+{
+    if (arena == NULL || phase_name == NULL) {
+        return -1;
+    }
+    if (strcmp(phase_name, "active_soon") == 0) {
+        mem_arena_lock(arena);
+        if (validate_region_id(arena, region_id) == 0) {
+            size_t max_chunks = arena->loops_cfg.prefetch_batch_chunks * 2U;
+            struct mem_arena_region *r = &arena->regions[region_id];
+            if (max_chunks == 0) {
+                max_chunks = 8;
+            }
+            for (size_t i = 0; i < r->chunk_count && i < max_chunks; i++) {
+                (void)prefetch_queue_push(arena, region_id, i, 3);
+            }
+        }
+        mem_arena_unlock(arena);
+    }
     return 0;
 }
 
@@ -753,7 +1697,9 @@ int mem_arena_get_stats(struct mem_arena *arena, struct mem_arena_stats *out_sta
         return -1;
     }
 
+    mem_arena_lock(arena);
     refresh_pool_stats(arena);
     *out_stats = arena->stats;
+    mem_arena_unlock(arena);
     return 0;
 }
