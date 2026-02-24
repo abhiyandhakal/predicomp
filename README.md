@@ -151,3 +151,31 @@ For per-process RAM before/after compression and compressor CPU cost, run
 `./mem-arena/process_mem_bench` (or `make mem-arena-bench`).
 The benchmark reports `ratio_e2e_post_comp` (primary), `ratio_admitted_post_comp`,
 `ratio_codec_post_comp`, and `admit_rate_post_comp`.
+
+### mem-arena 3-Loop Pilot (`interactive_burst`)
+
+`mem-arena` also includes a correctness-first internal 3-loop pilot for:
+
+- hotness tracking (touch metadata + optional page-protection sampling)
+- background compression (HOT/WARM/COLD policy)
+- proactive decompression/prefetch (phase hints + simple next-k prefetch)
+
+Pilot workload:
+
+- `workloads/bin/interactive_burst` with `--arena-autoloops`
+
+Example:
+
+```bash
+./workloads/bin/interactive_burst \
+  --duration-sec 20 \
+  --region-mb 256 \
+  --active-ms 100 \
+  --idle-ms 400 \
+  --use-mem-arena \
+  --arena-cap-mb 128 \
+  --arena-autoloops \
+  --compress-policy external
+```
+
+See `mem-arena/README.md` for loop flags, stats, and SIGSEGV sampling limitations.
