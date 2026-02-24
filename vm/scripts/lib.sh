@@ -43,12 +43,18 @@ vm_print_ssh_hint() {
 
 vm_qemu_common_args() {
   cat <<ARGS
--enable-kvm
--machine q35,accel=kvm
--cpu host
--smp ${VM_VCPUS}
--m ${VM_RAM_MB}
--device virtio-rng-pci
+-M
+q35
+-accel
+kvm
+-cpu
+host
+-smp
+${VM_VCPUS}
+-m
+${VM_RAM_MB}
+-device
+virtio-rng-pci
 -drive
 if=virtio,file=${VM_DISK_PATH_ABS},format=qcow2
 -netdev

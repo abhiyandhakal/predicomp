@@ -49,15 +49,17 @@ readarray -t COMMON_ARGS < <(vm_qemu_common_args)
 
 QEMU_ARGS=( "$QEMU_BIN" "${COMMON_ARGS[@]}" )
 
-if [[ $USE_VNC -eq 1 ]]; then
-  QEMU_ARGS+=( -display default )
-else
-  QEMU_ARGS+=( -nographic -serial mon:stdio )
-fi
-
 if [[ $DAEMONIZE -eq 1 ]]; then
   PIDFILE="$VM_RUN_DIR_ABS/${VM_NAME}.pid"
   QEMU_ARGS+=( -daemonize -pidfile "$PIDFILE" )
+fi
+
+if [[ $USE_VNC -eq 1 ]]; then
+  QEMU_ARGS+=( -display default )
+elif [[ $DAEMONIZE -eq 1 ]]; then
+  QEMU_ARGS+=( -display none -serial none )
+else
+  QEMU_ARGS+=( -nographic -serial mon:stdio )
 fi
 
 QEMU_ARGS+=("${EXTRA_ARGS[@]}")
