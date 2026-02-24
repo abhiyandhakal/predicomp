@@ -1,7 +1,7 @@
 # Guest package set for predicomp experiments (Arch Linux)
 # Record exact versions after install for reproducibility.
 # Example capture:
-#   pacman -Q linux linux-headers clang llvm bpftool libbpf lz4 gcc make | tee vm/config/guest-packages.txt
+#   pacman -Q linux linux-headers clang llvm bpf libbpf lz4 gcc make | tee vm/config/guest-packages.txt
 
 base
 linux
@@ -14,7 +14,7 @@ make
 gcc
 clang
 llvm
-bpftool
+bpf
 libbpf
 pkgconf
 lz4

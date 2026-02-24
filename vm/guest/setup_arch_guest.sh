@@ -17,5 +17,5 @@ sudo systemctl enable --now sshd
 
 echo "Guest package install complete."
 echo "Record package versions for pinning:" 
-echo "  pacman -Q linux linux-headers clang llvm bpftool libbpf lz4 gcc make | tee $PKG_FILE"
+echo "  pacman -Q linux linux-headers clang llvm bpf libbpf lz4 gcc make | tee $PKG_FILE"
 echo "Optional: configure IgnorePkg=linux linux-headers in /etc/pacman.conf for kernel pinning."

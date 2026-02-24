@@ -123,7 +123,7 @@ This installs the package set in `vm/config/guest-packages.txt` and enables `ssh
 Record exact package versions after a successful setup:
 
 ```bash
-pacman -Q linux linux-headers clang llvm bpftool libbpf lz4 gcc make | tee /mnt/predicomp/vm/config/guest-packages.txt
+pacman -Q linux linux-headers clang llvm bpf libbpf lz4 gcc make | tee /mnt/predicomp/vm/config/guest-packages.txt
 ```
 
 Then optionally pin the guest kernel packages in `/etc/pacman.conf`:
@@ -159,7 +159,7 @@ cd /mnt/predicomp
 
 Checks include:
 
-- `clang`, `bpftool`, `make`, `lz4`
+- `clang`, `bpftool` (from Arch package `bpf`), `make`, `lz4`
 - `/sys/kernel/btf/vmlinux`
 - `/sys/kernel/mm/damon/admin`
 - tracefs/debugfs visibility
@@ -229,7 +229,7 @@ Install/verify:
 
 - `clang`
 - `llvm`
-- `bpftool`
+- `bpftool` (Arch package: `bpf`)
 - `libbpf`
 - `linux-headers`
 
