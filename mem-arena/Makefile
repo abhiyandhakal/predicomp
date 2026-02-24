@@ -11,6 +11,7 @@ TOOL_DIR := tools
 LIB := libmemarena.a
 LIB_SRCS := \
 	$(SRC_DIR)/mem_arena.c \
+	$(SRC_DIR)/mem_arena_damon.c \
 	$(SRC_DIR)/mem_arena_codec.c \
 	$(SRC_DIR)/mem_arena_lru.c
 LIB_OBJS := $(LIB_SRCS:.c=.o)

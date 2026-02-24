@@ -7,6 +7,7 @@ BIN_DIR := bin
 MEM_ARENA_DIR := ../mem-arena
 MEM_ARENA_SRCS := \
 	$(MEM_ARENA_DIR)/src/mem_arena.c \
+	$(MEM_ARENA_DIR)/src/mem_arena_damon.c \
 	$(MEM_ARENA_DIR)/src/mem_arena_codec.c \
 	$(MEM_ARENA_DIR)/src/mem_arena_lru.c
 

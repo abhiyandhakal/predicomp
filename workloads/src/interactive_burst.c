@@ -197,12 +197,18 @@ int main(int argc, char **argv)
             loops_cfg.enable_hotness_loop = 1;
             loops_cfg.enable_compression_loop = arena_disable_bg_compress ? 0 : 1;
             loops_cfg.enable_prefetch_loop = arena_disable_prefetch ? 0 : 1;
-            loops_cfg.enable_touch_sampling = 1;
+            loops_cfg.enable_damon_classification = 1;
             loops_cfg.hotness_tick_ms = 50;
-            loops_cfg.sampling_tick_ms = 200;
             loops_cfg.compression_tick_ms = 100;
             loops_cfg.prefetch_tick_ms = 50;
-            loops_cfg.sampling_budget_pages = 64;
+            loops_cfg.damon_sample_us = 5000;
+            loops_cfg.damon_aggr_us = 100000;
+            loops_cfg.damon_update_us = 1000000;
+            loops_cfg.damon_nr_regions_min = 10;
+            loops_cfg.damon_nr_regions_max = 1000;
+            loops_cfg.damon_read_tick_ms = 200;
+            loops_cfg.damon_hot_accesses_min = 1;
+            loops_cfg.damon_warm_accesses_min = 0;
             loops_cfg.t_hot_epochs = 2;
             loops_cfg.t_cold_epochs_initial = (uint32_t)((arena_t_cold_ms + 99) / 100);
             if (loops_cfg.t_cold_epochs_initial < 2) {
@@ -294,7 +300,9 @@ int main(int argc, char **argv)
             wl_print_json_kv_u64("arena_decompress_ops", arena_stats.decompress_ops, false);
             wl_print_json_kv_u64("arena_evictions_lru", arena_stats.evictions_lru, false);
             wl_print_json_kv_u64("arena_hotness_epoch", arena_stats.hotness_epoch, false);
-            wl_print_json_kv_u64("arena_sampling_faults", arena_stats.sampling_faults_total, false);
+            wl_print_json_kv_u64("arena_damon_snapshots", arena_stats.damon_snapshots_total, false);
+            wl_print_json_kv_u64("arena_damon_regions_observed", arena_stats.damon_regions_observed_total, false);
+            wl_print_json_kv_u64("arena_damon_read_errors", arena_stats.damon_read_errors, false);
             wl_print_json_kv_u64("arena_bg_compress_attempts", arena_stats.bg_compress_attempts, false);
             wl_print_json_kv_u64("arena_bg_compress_admits", arena_stats.bg_compress_admits, false);
             wl_print_json_kv_u64("arena_prefetch_decompress_ops", arena_stats.prefetch_decompress_ops, false);
@@ -316,14 +324,17 @@ int main(int argc, char **argv)
                arena_autoloops);
         if (use_mem_arena) {
             printf(" arena_compress_ops=%" PRIu64 " arena_decompress_ops=%" PRIu64 " arena_evictions_lru=%" PRIu64
-                   " arena_hotness_epoch=%" PRIu64 " arena_sampling_faults=%" PRIu64 " arena_bg_compress_attempts=%" PRIu64
+                   " arena_hotness_epoch=%" PRIu64 " arena_damon_snapshots=%" PRIu64 " arena_damon_regions=%" PRIu64
+                   " arena_damon_read_errors=%" PRIu64 " arena_bg_compress_attempts=%" PRIu64
                    " arena_bg_compress_admits=%" PRIu64 " arena_prefetch_decompress_ops=%" PRIu64
                    " arena_demand_decomp_stalls=%" PRIu64,
                    arena_stats.compress_ops,
                    arena_stats.decompress_ops,
                    arena_stats.evictions_lru,
                    arena_stats.hotness_epoch,
-                   arena_stats.sampling_faults_total,
+                   arena_stats.damon_snapshots_total,
+                   arena_stats.damon_regions_observed_total,
+                   arena_stats.damon_read_errors,
                    arena_stats.bg_compress_attempts,
                    arena_stats.bg_compress_admits,
                    arena_stats.prefetch_decompress_ops,

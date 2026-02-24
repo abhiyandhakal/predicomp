@@ -1,12 +1,11 @@
 #include "mem_arena.h"
 
 #include "mem_arena_codec.h"
+#include "mem_arena_damon.h"
 
 #include <errno.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stddef.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +16,6 @@
 
 #define MEM_ARENA_MAX_REGIONS 64
 #define MEM_ARENA_POOL_ALIGN 8U
-#define MEM_ARENA_SAMPLER_FAULT_RING_CAP 4096
 
 enum mem_arena_temp_state {
     MEM_ARENA_STATE_HOT = 0,
@@ -35,12 +33,11 @@ struct mem_arena_chunk {
     uint64_t last_decompress_epoch;
     uint32_t touch_count_total;
     uint32_t touch_count_window;
-    uint32_t sampled_fault_hits_window;
     uint16_t last_comp_ratio_bps;
     uint8_t temp_state;
-    uint8_t sampling_armed;
     uint8_t prefetch_queued;
     uint8_t reserved0;
+    uint8_t reserved1;
 };
 
 struct mem_arena_region {
@@ -60,10 +57,6 @@ struct mem_arena_extent {
     size_t off;
     size_t len;
     struct mem_arena_extent *next;
-};
-
-struct mem_arena_fault_record {
-    uintptr_t addr;
 };
 
 struct mem_arena_prefetch_item {
@@ -90,18 +83,12 @@ struct mem_arena {
     pthread_t hotness_thread;
     pthread_t compression_thread;
     pthread_t prefetch_thread;
-    uint64_t next_sampling_epoch;
     uint64_t next_adapt_ns;
     struct mem_arena_prefetch_item *prefetch_q;
     size_t prefetch_q_cap;
     size_t prefetch_q_head;
     size_t prefetch_q_len;
-    atomic_size_t fault_ring_write_idx;
-    atomic_size_t fault_ring_read_idx;
-    struct mem_arena_fault_record fault_ring[MEM_ARENA_SAMPLER_FAULT_RING_CAP];
-    stack_t segv_altstack;
-    int segv_altstack_installed;
-    int owns_segv_handler;
+    struct mem_arena_damon damon;
 };
 
 struct live_chunk_ref {
@@ -110,11 +97,6 @@ struct live_chunk_ref {
     size_t off;
     size_t len;
 };
-
-static pthread_mutex_t g_sampler_mu = PTHREAD_MUTEX_INITIALIZER;
-static atomic_uintptr_t g_sampler_arena_ptr;
-static struct sigaction g_prev_segv_act;
-static int g_prev_segv_act_valid;
 
 int mem_arena_loops_stop(struct mem_arena *arena);
 
@@ -157,12 +139,18 @@ static struct mem_arena_loops_config default_loops_config(void)
     cfg.enable_hotness_loop = 1;
     cfg.enable_compression_loop = 1;
     cfg.enable_prefetch_loop = 1;
-    cfg.enable_touch_sampling = 1;
+    cfg.enable_damon_classification = 1;
     cfg.hotness_tick_ms = 100;
-    cfg.sampling_tick_ms = 200;
     cfg.compression_tick_ms = 100;
     cfg.prefetch_tick_ms = 50;
-    cfg.sampling_budget_pages = 16;
+    cfg.damon_sample_us = 5000;
+    cfg.damon_aggr_us = 100000;
+    cfg.damon_update_us = 1000000;
+    cfg.damon_nr_regions_min = 10;
+    cfg.damon_nr_regions_max = 1000;
+    cfg.damon_read_tick_ms = 200;
+    cfg.damon_hot_accesses_min = 1;
+    cfg.damon_warm_accesses_min = 0;
     cfg.t_hot_epochs = 5;
     cfg.t_cold_epochs_initial = 20;
     cfg.t_cold_epochs_min = 5;
@@ -226,166 +214,6 @@ static int prefetch_queue_pop(struct mem_arena *arena, struct mem_arena_prefetch
     arena->prefetch_q_head = (arena->prefetch_q_head + 1) % arena->prefetch_q_cap;
     arena->prefetch_q_len--;
     return 0;
-}
-
-static int fault_ring_push(struct mem_arena *arena, uintptr_t addr)
-{
-    size_t wr;
-    size_t rd;
-    size_t next;
-
-    if (arena == NULL) {
-        return -1;
-    }
-
-    wr = atomic_load_explicit(&arena->fault_ring_write_idx, memory_order_relaxed);
-    rd = atomic_load_explicit(&arena->fault_ring_read_idx, memory_order_acquire);
-    next = (wr + 1U) % MEM_ARENA_SAMPLER_FAULT_RING_CAP;
-    if (next == rd) {
-        return 1;
-    }
-    arena->fault_ring[wr].addr = addr;
-    atomic_store_explicit(&arena->fault_ring_write_idx, next, memory_order_release);
-    return 0;
-}
-
-static int fault_ring_pop(struct mem_arena *arena, struct mem_arena_fault_record *out_rec)
-{
-    size_t rd;
-    size_t wr;
-
-    if (arena == NULL || out_rec == NULL) {
-        return -1;
-    }
-
-    rd = atomic_load_explicit(&arena->fault_ring_read_idx, memory_order_relaxed);
-    wr = atomic_load_explicit(&arena->fault_ring_write_idx, memory_order_acquire);
-    if (rd == wr) {
-        return 1;
-    }
-
-    *out_rec = arena->fault_ring[rd];
-    rd = (rd + 1U) % MEM_ARENA_SAMPLER_FAULT_RING_CAP;
-    atomic_store_explicit(&arena->fault_ring_read_idx, rd, memory_order_release);
-    return 0;
-}
-
-static void mem_arena_segv_handler(int signo, siginfo_t *si, void *ucontext)
-{
-    struct mem_arena *arena;
-    uintptr_t fault_addr;
-    int handled = 0;
-
-    (void)ucontext;
-
-    arena = (struct mem_arena *)atomic_load_explicit(&g_sampler_arena_ptr, memory_order_acquire);
-
-    if (arena != NULL && si != NULL && si->si_addr != NULL) {
-        fault_addr = (uintptr_t)si->si_addr;
-        for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
-            struct mem_arena_region *r = &arena->regions[i];
-            uintptr_t start;
-            uintptr_t end;
-
-            if (!r->in_use || r->raw == NULL) {
-                continue;
-            }
-            start = (uintptr_t)r->raw;
-            end = start + r->alloc_bytes;
-            if (fault_addr < start || fault_addr >= end) {
-                continue;
-            }
-
-            if (arena->page_size > 0) {
-                uintptr_t page = fault_addr & ~((uintptr_t)arena->page_size - 1U);
-                (void)mprotect((void *)page, (size_t)arena->page_size, PROT_READ | PROT_WRITE);
-            }
-            if (fault_ring_push(arena, fault_addr) != 0) {
-                arena->stats.sampling_faults_dropped++;
-            }
-            handled = 1;
-            break;
-        }
-    }
-
-    if (handled) {
-        return;
-    }
-
-    signal(signo, SIG_DFL);
-    raise(signo);
-}
-
-static int install_sampler_handler(struct mem_arena *arena)
-{
-    struct sigaction act;
-
-    if (arena == NULL) {
-        return -1;
-    }
-
-    pthread_mutex_lock(&g_sampler_mu);
-    if ((struct mem_arena *)atomic_load_explicit(&g_sampler_arena_ptr, memory_order_acquire) != NULL &&
-        (struct mem_arena *)atomic_load_explicit(&g_sampler_arena_ptr, memory_order_acquire) != arena) {
-        pthread_mutex_unlock(&g_sampler_mu);
-        return -1;
-    }
-    if (!arena->segv_altstack_installed) {
-        arena->segv_altstack.ss_size = SIGSTKSZ * 2U;
-        arena->segv_altstack.ss_sp = malloc(arena->segv_altstack.ss_size);
-        arena->segv_altstack.ss_flags = 0;
-        if (arena->segv_altstack.ss_sp == NULL) {
-            pthread_mutex_unlock(&g_sampler_mu);
-            return -1;
-        }
-        if (sigaltstack(&arena->segv_altstack, NULL) != 0) {
-            free(arena->segv_altstack.ss_sp);
-            memset(&arena->segv_altstack, 0, sizeof(arena->segv_altstack));
-            pthread_mutex_unlock(&g_sampler_mu);
-            return -1;
-        }
-        arena->segv_altstack_installed = 1;
-    }
-
-    memset(&act, 0, sizeof(act));
-    act.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    act.sa_sigaction = mem_arena_segv_handler;
-    sigemptyset(&act.sa_mask);
-    if (!g_prev_segv_act_valid) {
-        if (sigaction(SIGSEGV, &act, &g_prev_segv_act) != 0) {
-            pthread_mutex_unlock(&g_sampler_mu);
-            return -1;
-        }
-        g_prev_segv_act_valid = 1;
-    } else {
-        if (sigaction(SIGSEGV, &act, NULL) != 0) {
-            pthread_mutex_unlock(&g_sampler_mu);
-            return -1;
-        }
-    }
-    atomic_store_explicit(&g_sampler_arena_ptr, (uintptr_t)arena, memory_order_release);
-    arena->owns_segv_handler = 1;
-    pthread_mutex_unlock(&g_sampler_mu);
-    return 0;
-}
-
-static void uninstall_sampler_handler(struct mem_arena *arena)
-{
-    if (arena == NULL) {
-        return;
-    }
-
-    pthread_mutex_lock(&g_sampler_mu);
-    if ((struct mem_arena *)atomic_load_explicit(&g_sampler_arena_ptr, memory_order_acquire) == arena) {
-        atomic_store_explicit(&g_sampler_arena_ptr, (uintptr_t)NULL, memory_order_release);
-        if (g_prev_segv_act_valid) {
-            (void)sigaction(SIGSEGV, &g_prev_segv_act, NULL);
-            g_prev_segv_act_valid = 0;
-            memset(&g_prev_segv_act, 0, sizeof(g_prev_segv_act));
-        }
-    }
-    arena->owns_segv_handler = 0;
-    pthread_mutex_unlock(&g_sampler_mu);
 }
 
 static size_t align_up(size_t value, size_t align)
@@ -569,7 +397,6 @@ static int free_chunk_extent(struct mem_arena *arena, struct mem_arena_chunk *ch
     chunk->pool_off = (size_t)-1;
     chunk->comp_len = 0;
     chunk->tick = ++arena->tick;
-    chunk->sampling_armed = 0;
     chunk->prefetch_queued = 0;
 
     refresh_pool_stats(arena);
@@ -710,7 +537,6 @@ static int decompress_chunk(struct mem_arena *arena, int region_id, size_t chunk
     arena->stats.decompress_ops++;
     arena->stats.access_hits_decompressed++;
     chunk->last_decompress_epoch = arena->epoch;
-    chunk->sampled_fault_hits_window = 0;
     chunk->touch_count_window++;
     chunk->temp_state = MEM_ARENA_STATE_HOT;
 
@@ -892,8 +718,6 @@ struct mem_arena *mem_arena_create(const struct mem_arena_config *cfg)
     if (arena->page_size <= 0) {
         arena->page_size = 4096;
     }
-    atomic_init(&arena->fault_ring_write_idx, 0);
-    atomic_init(&arena->fault_ring_read_idx, 0);
     if (pthread_mutex_init(&arena->mu, NULL) != 0) {
         free(arena);
         return NULL;
@@ -948,13 +772,6 @@ void mem_arena_destroy(struct mem_arena *arena)
     }
 
     free_extent_list(arena->free_extents);
-    if (arena->segv_altstack_installed) {
-        stack_t disable_stack;
-        memset(&disable_stack, 0, sizeof(disable_stack));
-        disable_stack.ss_flags = SS_DISABLE;
-        (void)sigaltstack(&disable_stack, NULL);
-        free(arena->segv_altstack.ss_sp);
-    }
     free(arena->prefetch_q);
     free(arena->pool);
     if (arena->mu_init) {
@@ -1233,98 +1050,121 @@ static void decay_touch_windows_locked(struct mem_arena *arena)
             struct mem_arena_chunk *c = &r->chunks[j];
 
             c->touch_count_window /= 2U;
-            c->sampled_fault_hits_window /= 2U;
         }
     }
 }
 
-static void drain_sampling_faults_locked(struct mem_arena *arena)
+static void apply_damon_snapshot_locked(
+    struct mem_arena *arena,
+    const struct mem_arena_damon_snapshot *snapshot
+)
 {
-    struct mem_arena_fault_record rec;
+    uint64_t hot_marks = 0;
+    uint64_t warm_marks = 0;
+    uint64_t cold_marks = 0;
+    uint32_t hot_thr;
+    uint32_t warm_thr;
 
-    while (fault_ring_pop(arena, &rec) == 0) {
-        uintptr_t addr = rec.addr;
+    if (arena == NULL || snapshot == NULL) {
+        return;
+    }
 
-        arena->stats.sampling_faults_total++;
-        for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
-            struct mem_arena_region *r = &arena->regions[i];
-            uintptr_t start;
-            uintptr_t end;
-            size_t page_off;
-            size_t chunk_idx;
-            struct mem_arena_chunk *c;
+    hot_thr = arena->loops_cfg.damon_hot_accesses_min ? arena->loops_cfg.damon_hot_accesses_min : 1;
+    warm_thr = arena->loops_cfg.damon_warm_accesses_min;
+
+    arena->stats.damon_snapshots_total++;
+    arena->stats.damon_last_snapshot_nr_regions = snapshot->count;
+    arena->stats.damon_last_snapshot_bytes = snapshot->total_bytes;
+    arena->stats.damon_regions_observed_total += snapshot->count;
+
+    for (size_t i = 0; i < snapshot->count; i++) {
+        const struct mem_arena_damon_region_obs *obs = &snapshot->regions[i];
+        uint64_t clamped_start;
+        uint64_t clamped_end;
+
+        if (obs->end <= obs->start) {
+            continue;
+        }
+
+        clamped_start = obs->start;
+        clamped_end = obs->end;
+
+        for (int rid = 0; rid < MEM_ARENA_MAX_REGIONS; rid++) {
+            struct mem_arena_region *r = &arena->regions[rid];
+            uint64_t base;
+            uint64_t limit;
 
             if (!r->in_use || r->raw == NULL) {
                 continue;
             }
-            start = (uintptr_t)r->raw;
-            end = start + r->alloc_bytes;
-            if (addr < start || addr >= end) {
+            base = (uint64_t)(uintptr_t)r->raw;
+            limit = base + (uint64_t)r->alloc_bytes;
+            if (clamped_end <= base || clamped_start >= limit) {
                 continue;
             }
-
-            page_off = (size_t)(addr - start);
-            chunk_idx = page_off / arena->cfg.chunk_size;
-            if (chunk_idx >= r->chunk_count) {
+            if (clamped_start < base) {
+                clamped_start = base;
+            }
+            if (clamped_end > limit) {
+                clamped_end = limit;
+            }
+            if (clamped_end <= clamped_start) {
                 break;
             }
-            c = &r->chunks[chunk_idx];
-            c->sampling_armed = 0;
-            c->sampled_fault_hits_window++;
-            c->last_touch_epoch = arena->epoch;
-            c->temp_state = MEM_ARENA_STATE_HOT;
-            if (arena->stats.sampling_pages_armed > 0) {
-                arena->stats.sampling_pages_armed--;
+
+            size_t first = (size_t)((clamped_start - base) / arena->cfg.chunk_size);
+            size_t last = (size_t)(((clamped_end - 1U) - base) / arena->cfg.chunk_size);
+            if (last >= r->chunk_count) {
+                last = r->chunk_count - 1;
+            }
+
+            for (size_t cidx = first; cidx <= last; cidx++) {
+                struct mem_arena_chunk *c = &r->chunks[cidx];
+
+                if (obs->nr_accesses >= hot_thr) {
+                    c->last_touch_epoch = arena->epoch;
+                    c->temp_state = MEM_ARENA_STATE_HOT;
+                    hot_marks++;
+                } else if (obs->nr_accesses >= warm_thr) {
+                    if (c->temp_state == MEM_ARENA_STATE_COLD) {
+                        c->temp_state = MEM_ARENA_STATE_WARM;
+                    }
+                    warm_marks++;
+                } else {
+                    cold_marks++;
+                }
             }
             break;
         }
     }
+
+    arena->stats.damon_chunks_marked_hot += hot_marks;
+    arena->stats.damon_chunks_marked_warm += warm_marks;
+    arena->stats.damon_chunks_marked_cold += cold_marks;
 }
 
-static void arm_sampling_pages_locked(struct mem_arena *arena)
+static void maybe_apply_damon_locked(struct mem_arena *arena)
 {
-    uint32_t budget;
+    struct mem_arena_damon_snapshot snapshot;
+    uint64_t now_ns;
+    int rc;
 
-    if (!arena->loops_cfg.enable_touch_sampling || arena->page_size <= 0) {
+    if (arena == NULL || !arena->loops_cfg.enable_damon_classification || !arena->damon.enabled) {
         return;
     }
-    if ((size_t)arena->cfg.chunk_size != (size_t)arena->page_size) {
+
+    now_ns = monotonic_ns();
+    rc = mem_arena_damon_poll_snapshot(&arena->damon, &arena->loops_cfg, now_ns, &snapshot);
+    if (rc == 1) {
         return;
     }
-    if (arena->epoch < arena->next_sampling_epoch) {
+    if (rc != 0) {
+        arena->stats.damon_read_errors++;
         return;
     }
-    budget = arena->loops_cfg.sampling_budget_pages;
-    if (budget == 0) {
-        budget = 1;
-    }
-    arena->next_sampling_epoch = arena->epoch + 1;
 
-    for (int i = 0; i < MEM_ARENA_MAX_REGIONS && budget > 0; i++) {
-        struct mem_arena_region *r = &arena->regions[i];
-
-        if (!r->in_use) {
-            continue;
-        }
-        for (size_t j = 0; j < r->chunk_count && budget > 0; j++) {
-            struct mem_arena_chunk *c = &r->chunks[j];
-            uint64_t age = (arena->epoch >= c->last_touch_epoch) ? (arena->epoch - c->last_touch_epoch) : 0;
-            void *page_addr;
-
-            if (c->compressed || c->sampling_armed) {
-                continue;
-            }
-            if (c->temp_state == MEM_ARENA_STATE_HOT && age <= 1) {
-                continue;
-            }
-            page_addr = r->raw + (j * arena->cfg.chunk_size);
-            if (mprotect(page_addr, (size_t)arena->page_size, PROT_NONE) == 0) {
-                c->sampling_armed = 1;
-                arena->stats.sampling_pages_armed++;
-                budget--;
-            }
-        }
-    }
+    apply_damon_snapshot_locked(arena, &snapshot);
+    mem_arena_damon_snapshot_free(&snapshot);
 }
 
 static void adapt_t_cold_locked(struct mem_arena *arena)
@@ -1385,10 +1225,9 @@ static void *hotness_loop_main(void *arg)
         mem_arena_lock(arena);
         arena->epoch++;
         arena->stats.hotness_epoch = arena->epoch;
-        drain_sampling_faults_locked(arena);
+        maybe_apply_damon_locked(arena);
         decay_touch_windows_locked(arena);
         update_chunk_temp_states_locked(arena);
-        arm_sampling_pages_locked(arena);
         mem_arena_unlock(arena);
         sleep_ms(arena->loops_cfg.hotness_tick_ms ? arena->loops_cfg.hotness_tick_ms : 100);
     }
@@ -1518,16 +1357,35 @@ int mem_arena_loops_start(struct mem_arena *arena, const struct mem_arena_loops_
     }
     arena->prefetch_q_head = 0;
     arena->prefetch_q_len = 0;
-    atomic_store(&arena->fault_ring_write_idx, 0);
-    atomic_store(&arena->fault_ring_read_idx, 0);
-    arena->next_sampling_epoch = 0;
     arena->next_adapt_ns = 0;
     arena->loops_running = 1;
     mem_arena_unlock(arena);
 
-    if (arena->loops_cfg.enable_touch_sampling) {
-        rc = install_sampler_handler(arena);
+    if (arena->loops_cfg.enable_damon_classification) {
+        int found_region = -1;
+        uint64_t start = 0;
+        uint64_t end = 0;
+
+        mem_arena_lock(arena);
+        for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
+            if (!arena->regions[i].in_use || arena->regions[i].raw == NULL) {
+                continue;
+            }
+            found_region = i;
+            start = (uint64_t)(uintptr_t)arena->regions[i].raw;
+            end = start + (uint64_t)arena->regions[i].alloc_bytes;
+            break;
+        }
+        mem_arena_unlock(arena);
+        if (found_region < 0) {
+            mem_arena_loops_stop(arena);
+            return -1;
+        }
+        rc = mem_arena_damon_setup(&arena->damon, getpid(), start, end, &arena->loops_cfg);
         if (rc != 0) {
+            mem_arena_lock(arena);
+            arena->stats.damon_setup_failures++;
+            mem_arena_unlock(arena);
             mem_arena_loops_stop(arena);
             return -1;
         }
@@ -1579,44 +1437,21 @@ int mem_arena_loops_stop(struct mem_arena *arena)
     arena->loops_running = 0;
     mem_arena_unlock(arena);
 
-    if (hot_enabled) {
+    if (hot_enabled && hot_t != (pthread_t)0) {
         (void)pthread_join(hot_t, NULL);
         arena->hotness_thread = (pthread_t)0;
     }
-    if (comp_enabled) {
+    if (comp_enabled && comp_t != (pthread_t)0) {
         (void)pthread_join(comp_t, NULL);
         arena->compression_thread = (pthread_t)0;
     }
-    if (pref_enabled) {
+    if (pref_enabled && pref_t != (pthread_t)0) {
         (void)pthread_join(pref_t, NULL);
         arena->prefetch_thread = (pthread_t)0;
     }
 
-    if (arena->loops_cfg.enable_touch_sampling) {
-        mem_arena_lock(arena);
-        for (int i = 0; i < MEM_ARENA_MAX_REGIONS; i++) {
-            struct mem_arena_region *r = &arena->regions[i];
-
-            if (!r->in_use || r->raw == NULL) {
-                continue;
-            }
-            if ((size_t)arena->cfg.chunk_size != (size_t)arena->page_size) {
-                continue;
-            }
-            for (size_t j = 0; j < r->chunk_count; j++) {
-                struct mem_arena_chunk *c = &r->chunks[j];
-                if (!c->sampling_armed) {
-                    continue;
-                }
-                (void)mprotect(r->raw + (j * arena->cfg.chunk_size),
-                               (size_t)arena->page_size,
-                               PROT_READ | PROT_WRITE);
-                c->sampling_armed = 0;
-            }
-        }
-        arena->stats.sampling_pages_armed = 0;
-        mem_arena_unlock(arena);
-        uninstall_sampler_handler(arena);
+    if (arena->loops_cfg.enable_damon_classification) {
+        mem_arena_damon_stop(&arena->damon);
     }
 
     return 0;
