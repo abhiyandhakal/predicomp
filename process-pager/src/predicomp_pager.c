@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/userfaultfd.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -47,6 +48,8 @@ enum page_state {
 
 struct cfg {
     char sock_path[108];
+    char csv_path[PATH_MAX];
+    int csv_enabled;
     uint64_t soft_cap_bytes;
     uint32_t damon_sample_us;
     uint32_t damon_aggr_us;
@@ -55,6 +58,9 @@ struct cfg {
     uint32_t damon_nr_regions_min;
     uint32_t damon_nr_regions_max;
     uint32_t cold_age_ms;
+    uint32_t latency_sample_step;
+    uint32_t latency_max_samples;
+    FILE *csv_fp;
     int verbose;
 };
 
@@ -85,6 +91,35 @@ struct page_entry {
 struct map_slot {
     uintptr_t key;
     uint32_t idx_plus1;
+};
+
+struct latency_collector {
+    uint64_t *vals;
+    size_t count;
+    size_t cap;
+};
+
+struct latency_stats {
+    uint64_t samples;
+    uint64_t p50_ns;
+    uint64_t p95_ns;
+    uint64_t p99_ns;
+    uint64_t max_ns;
+    double avg_ns;
+};
+
+enum latency_kind {
+    LAT_COMPRESS_WALL = 0,
+    LAT_COMPRESS_CPU = 1,
+    LAT_RESTORE_WALL = 2,
+    LAT_RESTORE_CPU = 3,
+    LAT_RESTORE_CODEC_WALL = 4,
+    LAT_FAULT_ALL = 5,
+    LAT_FAULT_MISSING = 6,
+    LAT_FAULT_WP = 7,
+    LAT_CLIENT_EVICT_RPC = 8,
+    LAT_PROCESS_MADVISE = 9,
+    LAT_KIND_COUNT = 10,
 };
 
 struct metrics {
@@ -120,6 +155,32 @@ struct metrics {
     uint64_t client_evict_success;
     uint64_t client_evict_failures;
     uint64_t compress_wp_only_fallback;
+    uint64_t session_start_ns;
+    uint64_t session_end_ns;
+    uint64_t session_wall_ns;
+    uint64_t control_thread_cpu_ns;
+    uint64_t bg_thread_cpu_ns;
+    uint64_t fault_thread_cpu_ns;
+    uint64_t compress_cpu_ns_total;
+    uint64_t compress_cpu_ns_max;
+    uint64_t restore_cpu_ns_total;
+    uint64_t restore_cpu_ns_max;
+    uint64_t restore_codec_wall_ns_total;
+    uint64_t restore_codec_wall_ns_max;
+    uint64_t restore_codec_cpu_ns_total;
+    uint64_t restore_codec_cpu_ns_max;
+    uint64_t restore_missing_count;
+    uint64_t restore_wp_count;
+    uint64_t fault_missing_service_ns_total;
+    uint64_t fault_missing_service_ns_max;
+    uint64_t fault_wp_service_ns_total;
+    uint64_t fault_wp_service_ns_max;
+    uint64_t client_evict_rpc_ns_total;
+    uint64_t client_evict_rpc_ns_max;
+    uint64_t process_madvise_ns_total;
+    uint64_t process_madvise_ns_max;
+    uint64_t latency_samples_dropped;
+    uint64_t latency_collector_ooms;
     uint64_t compress_ns_total;
     uint64_t restore_ns_total;
     uint64_t fault_service_ns_total;
@@ -151,6 +212,9 @@ struct session {
     uint64_t region_min;
     uint64_t region_max;
     struct metrics m;
+    struct latency_collector lat_lc[LAT_KIND_COUNT];
+    struct latency_stats lat_stats[LAT_KIND_COUNT];
+    uint64_t lat_seen[LAT_KIND_COUNT];
     int evict_wp_only_mode;
     int logged_process_madvise_errno;
 };
@@ -163,6 +227,147 @@ static uint64_t now_ns(void)
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t thread_cpu_now_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void lc_init(struct latency_collector *lc)
+{
+    lc->vals = NULL;
+    lc->count = 0;
+    lc->cap = 0;
+}
+
+static void lc_free(struct latency_collector *lc)
+{
+    free(lc->vals);
+    lc->vals = NULL;
+    lc->count = 0;
+    lc->cap = 0;
+}
+
+static int lc_push_bounded(struct latency_collector *lc, uint64_t ns, size_t max_samples)
+{
+    uint64_t *next;
+    size_t next_cap;
+
+    if (max_samples > 0 && lc->count >= max_samples) {
+        errno = ENOSPC;
+        return -1;
+    }
+    if (lc->count == lc->cap) {
+        next_cap = (lc->cap == 0) ? 1024U : lc->cap * 2U;
+        if (max_samples > 0 && next_cap > max_samples) {
+            next_cap = max_samples;
+        }
+        if (next_cap == lc->cap) {
+            errno = ENOSPC;
+            return -1;
+        }
+        next = realloc(lc->vals, next_cap * sizeof(*next));
+        if (next == NULL) {
+            return -1;
+        }
+        lc->vals = next;
+        lc->cap = next_cap;
+    }
+    lc->vals[lc->count++] = ns;
+    return 0;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t va;
+    uint64_t vb;
+
+    va = *(const uint64_t *)a;
+    vb = *(const uint64_t *)b;
+    if (va < vb) {
+        return -1;
+    }
+    if (va > vb) {
+        return 1;
+    }
+    return 0;
+}
+
+static uint64_t percentile_u64(const uint64_t *vals, size_t n, int pct)
+{
+    size_t idx;
+
+    if (n == 0) {
+        return 0;
+    }
+    if (pct <= 0) {
+        return vals[0];
+    }
+    if (pct >= 100) {
+        return vals[n - 1];
+    }
+    idx = (size_t)(((uint64_t)(n - 1) * (uint64_t)pct + 99U) / 100U);
+    if (idx >= n) {
+        idx = n - 1;
+    }
+    return vals[idx];
+}
+
+static int finalize_latency(const struct latency_collector *lc, struct latency_stats *out)
+{
+    uint64_t *tmp;
+    size_t i;
+    long double sum;
+
+    memset(out, 0, sizeof(*out));
+    if (lc->count == 0) {
+        return 0;
+    }
+    tmp = malloc(lc->count * sizeof(*tmp));
+    if (tmp == NULL) {
+        return -1;
+    }
+    memcpy(tmp, lc->vals, lc->count * sizeof(*tmp));
+    qsort(tmp, lc->count, sizeof(*tmp), cmp_u64);
+    out->samples = (uint64_t)lc->count;
+    out->max_ns = tmp[lc->count - 1];
+    out->p50_ns = percentile_u64(tmp, lc->count, 50);
+    out->p95_ns = percentile_u64(tmp, lc->count, 95);
+    out->p99_ns = percentile_u64(tmp, lc->count, 99);
+    sum = 0.0;
+    for (i = 0; i < lc->count; i++) {
+        sum += (long double)lc->vals[i];
+    }
+    out->avg_ns = (double)(sum / (long double)lc->count);
+    free(tmp);
+    return 0;
+}
+
+static void maybe_sample_latency(struct session *s, enum latency_kind kind, uint64_t ns)
+{
+    uint64_t seen;
+    uint32_t step;
+
+    if (s == NULL || kind < 0 || kind >= LAT_KIND_COUNT) {
+        return;
+    }
+    seen = ++s->lat_seen[kind];
+    step = s->cfg.latency_sample_step == 0 ? 1U : s->cfg.latency_sample_step;
+    if ((seen % step) != 0) {
+        return;
+    }
+    if (lc_push_bounded(&s->lat_lc[kind], ns, (size_t)s->cfg.latency_max_samples) != 0) {
+        s->m.latency_samples_dropped++;
+        if (errno != ENOSPC) {
+            s->m.latency_collector_ooms++;
+        }
+    }
 }
 
 static void on_sigint(int sig)
@@ -535,11 +740,14 @@ static int client_evict_page_locked(struct session *s, uintptr_t addr, size_t le
 {
     struct predicomp_msg_evict_req req;
     struct predicomp_msg_evict_ack ack;
+    uint64_t t0;
+    uint64_t dt;
 
     if (s->rpc_fd < 0) {
         errno = ENOTCONN;
         return -1;
     }
+    t0 = now_ns();
     memset(&req, 0, sizeof(req));
     req.hdr.type = PREDICOMP_MSG_EVICT_REQ;
     req.hdr.size = sizeof(req);
@@ -561,6 +769,12 @@ static int client_evict_page_locked(struct session *s, uintptr_t addr, size_t le
         errno = ack.err_no ? ack.err_no : EIO;
         return -1;
     }
+    dt = now_ns() - t0;
+    s->m.client_evict_rpc_ns_total += dt;
+    if (dt > s->m.client_evict_rpc_ns_max) {
+        s->m.client_evict_rpc_ns_max = dt;
+    }
+    maybe_sample_latency(s, LAT_CLIENT_EVICT_RPC, dt);
     return 0;
 }
 
@@ -600,8 +814,16 @@ static int handle_missing_fault_locked(struct session *s, struct page_entry *p, 
     struct uffdio_copy cp;
     int rc;
     uint64_t t0;
+    uint64_t c0;
+    uint64_t codec_t0;
+    uint64_t codec_c0;
+    uint64_t dt;
+    uint64_t cpu_dt;
+    uint64_t codec_dt;
+    uint64_t codec_cpu_dt;
 
     t0 = now_ns();
+    c0 = thread_cpu_now_ns();
     s->m.faults_missing_total++;
 
     if (p == NULL) {
@@ -613,7 +835,11 @@ static int handle_missing_fault_locked(struct session *s, struct page_entry *p, 
     }
 
     if (p->state == PAGE_STATE_COMPRESSED && p->blob != NULL && p->blob_len > 0) {
+        codec_t0 = now_ns();
+        codec_c0 = thread_cpu_now_ns();
         rc = mem_arena_lz4_decompress(p->blob, (int)p->blob_len, pagebuf, (int)PAGE_SZ);
+        codec_dt = now_ns() - codec_t0;
+        codec_cpu_dt = thread_cpu_now_ns() - codec_c0;
         if (rc != (int)PAGE_SZ) {
             s->m.restore_failures++;
             return -1;
@@ -629,7 +855,28 @@ static int handle_missing_fault_locked(struct session *s, struct page_entry *p, 
         }
 
         s->m.restore_success++;
-        s->m.restore_ns_total += now_ns() - t0;
+        dt = now_ns() - t0;
+        cpu_dt = thread_cpu_now_ns() - c0;
+        s->m.restore_ns_total += dt;
+        s->m.restore_cpu_ns_total += cpu_dt;
+        s->m.restore_codec_wall_ns_total += codec_dt;
+        s->m.restore_codec_cpu_ns_total += codec_cpu_dt;
+        if (dt > s->m.restore_cpu_ns_max) {
+            /* temp max set below for cpu; keep wall max separate via collectors */
+        }
+        if (cpu_dt > s->m.restore_cpu_ns_max) {
+            s->m.restore_cpu_ns_max = cpu_dt;
+        }
+        if (codec_dt > s->m.restore_codec_wall_ns_max) {
+            s->m.restore_codec_wall_ns_max = codec_dt;
+        }
+        if (codec_cpu_dt > s->m.restore_codec_cpu_ns_max) {
+            s->m.restore_codec_cpu_ns_max = codec_cpu_dt;
+        }
+        s->m.restore_missing_count++;
+        maybe_sample_latency(s, LAT_RESTORE_WALL, dt);
+        maybe_sample_latency(s, LAT_RESTORE_CPU, cpu_dt);
+        maybe_sample_latency(s, LAT_RESTORE_CODEC_WALL, codec_dt);
         p->last_restore_ns = now_ns();
         if (s->m.store_bytes_live >= p->blob_len) {
             s->m.store_bytes_live -= p->blob_len;
@@ -660,6 +907,7 @@ static int handle_missing_fault_locked(struct session *s, struct page_entry *p, 
 static int handle_wp_fault_locked(struct session *s, struct page_entry *p, uintptr_t addr)
 {
     uint64_t t0;
+    uint64_t c0;
 
     s->m.faults_wp_total++;
     if (p == NULL) {
@@ -667,17 +915,46 @@ static int handle_wp_fault_locked(struct session *s, struct page_entry *p, uintp
         return -1;
     }
     t0 = now_ns();
+    c0 = thread_cpu_now_ns();
     if (p->state == PAGE_STATE_COMPRESSED && p->blob != NULL && p->blob_len > 0) {
         unsigned char pagebuf[PAGE_SZ];
         int rc;
+        uint64_t codec_t0;
+        uint64_t codec_c0;
+        uint64_t codec_dt;
+        uint64_t codec_cpu_dt;
+        uint64_t dt;
+        uint64_t cpu_dt;
 
+        codec_t0 = now_ns();
+        codec_c0 = thread_cpu_now_ns();
         rc = mem_arena_lz4_decompress(p->blob, (int)p->blob_len, pagebuf, (int)PAGE_SZ);
+        codec_dt = now_ns() - codec_t0;
+        codec_cpu_dt = thread_cpu_now_ns() - codec_c0;
         if (rc != (int)PAGE_SZ) {
             s->m.restore_failures++;
             return -1;
         }
         s->m.restore_success++;
-        s->m.restore_ns_total += now_ns() - t0;
+        dt = now_ns() - t0;
+        cpu_dt = thread_cpu_now_ns() - c0;
+        s->m.restore_ns_total += dt;
+        s->m.restore_cpu_ns_total += cpu_dt;
+        s->m.restore_codec_wall_ns_total += codec_dt;
+        s->m.restore_codec_cpu_ns_total += codec_cpu_dt;
+        if (cpu_dt > s->m.restore_cpu_ns_max) {
+            s->m.restore_cpu_ns_max = cpu_dt;
+        }
+        if (codec_dt > s->m.restore_codec_wall_ns_max) {
+            s->m.restore_codec_wall_ns_max = codec_dt;
+        }
+        if (codec_cpu_dt > s->m.restore_codec_cpu_ns_max) {
+            s->m.restore_codec_cpu_ns_max = codec_cpu_dt;
+        }
+        s->m.restore_wp_count++;
+        maybe_sample_latency(s, LAT_RESTORE_WALL, dt);
+        maybe_sample_latency(s, LAT_RESTORE_CPU, cpu_dt);
+        maybe_sample_latency(s, LAT_RESTORE_CODEC_WALL, codec_dt);
         p->last_restore_ns = now_ns();
         if (s->m.store_bytes_live >= p->blob_len) {
             s->m.store_bytes_live -= p->blob_len;
@@ -702,8 +979,10 @@ static void *fault_thread_main(void *arg)
 {
     struct session *s;
     struct pollfd pfd;
+    uint64_t cpu_start_ns;
 
     s = (struct session *)arg;
+    cpu_start_ns = thread_cpu_now_ns();
     memset(&pfd, 0, sizeof(pfd));
     pfd.fd = s->uffd;
     pfd.events = POLLIN;
@@ -761,10 +1040,27 @@ static void *fault_thread_main(void *arg)
             if (dt > s->m.fault_service_ns_max) {
                 s->m.fault_service_ns_max = dt;
             }
+            maybe_sample_latency(s, LAT_FAULT_ALL, dt);
+            if (is_wp) {
+                s->m.fault_wp_service_ns_total += dt;
+                if (dt > s->m.fault_wp_service_ns_max) {
+                    s->m.fault_wp_service_ns_max = dt;
+                }
+                maybe_sample_latency(s, LAT_FAULT_WP, dt);
+            } else {
+                s->m.fault_missing_service_ns_total += dt;
+                if (dt > s->m.fault_missing_service_ns_max) {
+                    s->m.fault_missing_service_ns_max = dt;
+                }
+                maybe_sample_latency(s, LAT_FAULT_MISSING, dt);
+            }
             pthread_mutex_unlock(&s->mu);
         }
     }
 
+    pthread_mutex_lock(&s->mu);
+    s->m.fault_thread_cpu_ns += thread_cpu_now_ns() - cpu_start_ns;
+    pthread_mutex_unlock(&s->mu);
     return NULL;
 }
 
@@ -851,6 +1147,19 @@ static int maybe_warn_soft_cap_locked(struct session *s)
     return 0;
 }
 
+static int finalize_session_latency_stats(struct session *s)
+{
+    int i;
+
+    for (i = 0; i < LAT_KIND_COUNT; i++) {
+        if (finalize_latency(&s->lat_lc[i], &s->lat_stats[i]) != 0) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int arm_wp_for_candidate_locked(struct session *s, struct page_entry *p)
 {
     if (p->state != PAGE_STATE_PRESENT || p->wp_active) {
@@ -877,6 +1186,11 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
     int evict_done;
     uint8_t *new_blob;
     uint64_t t0;
+    uint64_t c0;
+    uint64_t dt;
+    uint64_t cpu_dt;
+    uint64_t madv_t0;
+    uint64_t madv_dt;
 
     if (p->state != PAGE_STATE_PRESENT || !p->is_cold || !p->wp_active || p->dirty) {
         return 0;
@@ -886,6 +1200,7 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
     }
 
     t0 = now_ns();
+    c0 = thread_cpu_now_ns();
     s->m.compress_attempts++;
 
     local_iov.iov_base = pagebuf;
@@ -918,7 +1233,14 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
 
     evict_done = 0;
     if (!s->evict_wp_only_mode && !s->evict_client_rpc_mode) {
+        madv_t0 = now_ns();
         madv_rc = process_madvise_wrap(s->pidfd, (void *)p->addr, PAGE_SZ, MADV_DONTNEED);
+        madv_dt = now_ns() - madv_t0;
+        if (madv_dt > s->m.process_madvise_ns_max) {
+            s->m.process_madvise_ns_max = madv_dt;
+        }
+        s->m.process_madvise_ns_total += madv_dt;
+        maybe_sample_latency(s, LAT_PROCESS_MADVISE, madv_dt);
         if (madv_rc < 0) {
             int saved_errno;
 
@@ -997,15 +1319,25 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
     if (s->m.store_bytes_live > s->m.store_bytes_peak) {
         s->m.store_bytes_peak = s->m.store_bytes_live;
     }
-    s->m.compress_ns_total += now_ns() - t0;
+    dt = now_ns() - t0;
+    cpu_dt = thread_cpu_now_ns() - c0;
+    s->m.compress_ns_total += dt;
+    s->m.compress_cpu_ns_total += cpu_dt;
+    if (cpu_dt > s->m.compress_cpu_ns_max) {
+        s->m.compress_cpu_ns_max = cpu_dt;
+    }
+    maybe_sample_latency(s, LAT_COMPRESS_WALL, dt);
+    maybe_sample_latency(s, LAT_COMPRESS_CPU, cpu_dt);
     return 1;
 }
 
 static void *bg_thread_main(void *arg)
 {
     struct session *s;
+    uint64_t cpu_start_ns;
 
     s = (struct session *)arg;
+    cpu_start_ns = thread_cpu_now_ns();
     while (!g_stop && !s->stop) {
         struct pager_damon_snapshot snap;
         int rc;
@@ -1057,14 +1389,47 @@ static void *bg_thread_main(void *arg)
 
         usleep((useconds_t)(s->cfg.damon_read_tick_ms ? s->cfg.damon_read_tick_ms : 200) * 1000U);
     }
+    pthread_mutex_lock(&s->mu);
+    s->m.bg_thread_cpu_ns += thread_cpu_now_ns() - cpu_start_ns;
+    pthread_mutex_unlock(&s->mu);
     return NULL;
 }
 
 static void dump_metrics(const struct session *s)
 {
     const struct metrics *m;
+    double wall_ms;
+    double daemon_cpu_pct;
+    double bg_cpu_pct;
+    double fault_cpu_pct;
+    double control_cpu_pct;
+    const char *evict_mode;
+    const struct latency_stats *fault_all;
+    const struct latency_stats *restore_wall;
 
     m = &s->m;
+    wall_ms = (double)m->session_wall_ns / 1000000.0;
+    if (m->session_wall_ns > 0) {
+        daemon_cpu_pct = 100.0 * (double)(m->control_thread_cpu_ns + m->bg_thread_cpu_ns + m->fault_thread_cpu_ns) /
+                         (double)m->session_wall_ns;
+        bg_cpu_pct = 100.0 * (double)m->bg_thread_cpu_ns / (double)m->session_wall_ns;
+        fault_cpu_pct = 100.0 * (double)m->fault_thread_cpu_ns / (double)m->session_wall_ns;
+        control_cpu_pct = 100.0 * (double)m->control_thread_cpu_ns / (double)m->session_wall_ns;
+    } else {
+        daemon_cpu_pct = 0.0;
+        bg_cpu_pct = 0.0;
+        fault_cpu_pct = 0.0;
+        control_cpu_pct = 0.0;
+    }
+    if (s->evict_wp_only_mode) {
+        evict_mode = "wp_only";
+    } else if (s->evict_client_rpc_mode) {
+        evict_mode = "client_rpc";
+    } else {
+        evict_mode = "remote";
+    }
+    fault_all = &s->lat_stats[LAT_FAULT_ALL];
+    restore_wall = &s->lat_stats[LAT_RESTORE_WALL];
     fprintf(stderr,
             "predicomp_pager: session pid=%d ranges=%" PRIu64 " pages=%" PRIu64 " damon_ok=%" PRIu64
             " damon_fail=%" PRIu64 " snapshots=%" PRIu64 " damon_regions=%" PRIu64
@@ -1078,6 +1443,10 @@ static void dump_metrics(const struct session *s)
             " process_madvise_fail=%" PRIu64 " process_madvise_unsupported=%" PRIu64
             " client_evict_ok=%" PRIu64 " client_evict_fail=%" PRIu64
             " compress_wp_only_fallback=%" PRIu64
+            " evict_mode=%s"
+            " session_ms=%.3f cpu_pct_total=%.2f cpu_pct_bg=%.2f cpu_pct_fault=%.2f cpu_pct_ctrl=%.2f"
+            " fault_p95=%" PRIu64 " fault_p99=%" PRIu64
+            " restore_p95=%" PRIu64 " restore_p99=%" PRIu64
             " fault_ns_total=%" PRIu64 " fault_ns_max=%" PRIu64
             " compress_ns_total=%" PRIu64 " restore_ns_total=%" PRIu64 "\n",
             s->pid,
@@ -1112,6 +1481,16 @@ static void dump_metrics(const struct session *s)
             m->client_evict_success,
             m->client_evict_failures,
             m->compress_wp_only_fallback,
+            evict_mode,
+            wall_ms,
+            daemon_cpu_pct,
+            bg_cpu_pct,
+            fault_cpu_pct,
+            control_cpu_pct,
+            fault_all->p95_ns,
+            fault_all->p99_ns,
+            restore_wall->p95_ns,
+            restore_wall->p99_ns,
             m->fault_service_ns_total,
             m->fault_service_ns_max,
             m->compress_ns_total,
@@ -1141,6 +1520,13 @@ static void stop_session(struct session *s)
         pager_damon_stop(&s->damon);
     }
     if (was_active) {
+        s->m.session_end_ns = now_ns();
+        if (s->m.session_end_ns >= s->m.session_start_ns) {
+            s->m.session_wall_ns = s->m.session_end_ns - s->m.session_start_ns;
+        }
+        if (finalize_session_latency_stats(s) != 0) {
+            s->m.latency_collector_ooms++;
+        }
         dump_metrics(s);
     }
 
@@ -1169,6 +1555,11 @@ static void stop_session(struct session *s)
     s->ranges = NULL;
     s->nr_ranges = 0;
     s->ranges_cap = 0;
+    for (i = 0; i < LAT_KIND_COUNT; i++) {
+        lc_free(&s->lat_lc[i]);
+        memset(&s->lat_stats[i], 0, sizeof(s->lat_stats[i]));
+        s->lat_seen[i] = 0;
+    }
     memset(&s->m, 0, sizeof(s->m));
     s->region_min = 0;
     s->region_max = 0;
@@ -1177,12 +1568,17 @@ static void stop_session(struct session *s)
 
 static void reset_session_for_client(struct session *s, int client_fd)
 {
+    int i;
+
     memset(s, 0, sizeof(*s));
     s->client_fd = client_fd;
     s->rpc_fd = -1;
     s->uffd = -1;
     s->pidfd = -1;
     pthread_mutex_init(&s->mu, NULL);
+    for (i = 0; i < LAT_KIND_COUNT; i++) {
+        lc_init(&s->lat_lc[i]);
+    }
 }
 
 static void destroy_session_struct(struct session *s)
@@ -1220,6 +1616,7 @@ static int start_runtime(struct session *s)
 
     s->stop = 0;
     s->active = 1;
+    s->m.session_start_ns = now_ns();
     if (pthread_create(&s->fault_thread, NULL, fault_thread_main, s) != 0) {
         return -1;
     }
@@ -1241,9 +1638,11 @@ static int handle_client(int client_fd, const struct cfg *daemon_cfg)
     struct predicomp_msg_hdr hdr;
     size_t i;
     int rc;
+    uint64_t control_cpu_start_ns;
 
     reset_session_for_client(&s, client_fd);
     s.cfg = *daemon_cfg;
+    control_cpu_start_ns = thread_cpu_now_ns();
 
     rc = recv_full(client_fd, &hello, sizeof(hello));
     if (rc != 0) {
@@ -1372,6 +1771,7 @@ static int handle_client(int client_fd, const struct cfg *daemon_cfg)
         }
     }
 
+    s.m.control_thread_cpu_ns += thread_cpu_now_ns() - control_cpu_start_ns;
     stop_session(&s);
     destroy_session_struct(&s);
     return 0;
