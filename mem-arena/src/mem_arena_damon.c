@@ -242,7 +242,10 @@ static int configure_single_context_target_region(
         return -1;
     }
     if (write_text_file(path, "commit") != 0) {
-        return fail_errno("write state=commit", path);
+        if (errno != EINVAL) {
+            return fail_errno("write state=commit", path);
+        }
+        /* Some kernels apply admin-tree writes immediately and reject 'commit'. */
     }
     if (write_text_file(path, "on") != 0) {
         return fail_errno("write state=on", path);
