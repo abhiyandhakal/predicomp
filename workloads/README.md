@@ -118,7 +118,7 @@ Memory-like workloads that support direct integration with `mem-arena`:
 - `bin/random_touch_heap`
 - `bin/mmap_churn` (hybrid mode: real mmap churn + sidecar mem-arena compression target)
 
-`bin/interactive_burst` is the current recommended `mem-arena` pilot workload and supports an internal 3-loop mode (hotness/compress/prefetch) via `--arena-autoloops`.
+`bin/interactive_burst` is the current recommended `mem-arena` pilot workload and supports an internal 3-loop mode (DAMON-based hotness + compression + prefetch) via `--arena-autoloops`.
 
 Shared flags:
 
@@ -148,7 +148,7 @@ Examples:
 Recommended internal 3-loop pilot example (`interactive_burst`):
 
 ```bash
-./workloads/bin/interactive_burst \
+sudo ./workloads/bin/interactive_burst \
   --duration-sec 20 \
   --region-mb 256 \
   --active-ms 100 \
@@ -157,6 +157,9 @@ Recommended internal 3-loop pilot example (`interactive_burst`):
   --arena-cap-mb 128 \
   --arena-autoloops
 ```
+
+`--arena-autoloops` currently uses the kernel DAMON sysfs admin interface for
+hotness classification, so root privileges are required for the pilot path.
 
 See `mem-arena/README.md` for arena architecture and metric definitions.
 For formal per-process RAM before/after compression + compressor CPU accounting,

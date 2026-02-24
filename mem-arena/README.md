@@ -100,7 +100,7 @@ Example:
 
 `interactive_burst` now supports a correctness-first `mem-arena` pilot mode with:
 
-- hotness tracking loop (explicit touches + page-protection sampling)
+- hotness tracking loop (explicit touches + DAMON-based classification)
 - background compression loop
 - proactive prefetch loop (phase hint + next-k prefetch)
 
@@ -116,7 +116,7 @@ Pilot flags:
 Example (idle-heavy, easier to observe loop activity):
 
 ```bash
-./workloads/bin/interactive_burst \
+sudo ./workloads/bin/interactive_burst \
   --duration-sec 8 \
   --region-mb 8 \
   --active-ms 20 \
@@ -126,6 +126,11 @@ Example (idle-heavy, easier to observe loop activity):
   --arena-autoloops \
   --arena-t-cold-ms 100
 ```
+
+Notes:
+
+- `--arena-autoloops` currently uses the kernel DAMON sysfs admin interface for hotness classification and therefore requires root privileges.
+- DAMON is used for classification only in this pilot (no DAMOS memory actions are applied).
 
 ## Stats
 
@@ -149,7 +154,9 @@ Example (idle-heavy, easier to observe loop activity):
 - `compression_reject_small_gain` (subset: rejected due to savings threshold)
 - 3-loop pilot stats:
   - `hotness_epoch`, `chunks_hot`, `chunks_warm`, `chunks_cold`
-  - `sampling_pages_armed`, `sampling_faults_total`, `sampling_faults_dropped`
+  - `damon_snapshots_total`, `damon_regions_observed_total`, `damon_read_errors`
+  - `damon_chunks_marked_hot`, `damon_chunks_marked_warm`, `damon_chunks_marked_cold`
+  - `damon_last_snapshot_nr_regions`, `damon_last_snapshot_bytes`
   - `bg_compress_attempts`, `bg_compress_admits`, `bg_compress_skipped_*`
   - `prefetch_queue_enqueues`, `prefetch_queue_dedup_skips`, `prefetch_decompress_ops`
   - `demand_decompress_stall_events`, `demand_decompress_stall_ns_total`
@@ -237,4 +244,4 @@ The measured process is the benchmark process itself (managed test process path)
 - Managed-buffer scope only (not transparent process-wide memory interception).
 - Memory reclaim hints (`madvise`) are best effort and kernel-dependent.
 - LZ4 is the only codec in this phase.
-- 3-loop pilot sampling uses a process-global `SIGSEGV` handler for mem-arena-managed pages and is research-grade / invasive (not production-safe).
+- 3-loop pilot hotness classification currently depends on DAMON sysfs admin access and expects exclusive DAMON use for the run.

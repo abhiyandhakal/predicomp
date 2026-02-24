@@ -160,7 +160,7 @@ The benchmark reports `ratio_e2e_post_comp` (primary), `ratio_admitted_post_comp
 
 `mem-arena` also includes a correctness-first internal 3-loop pilot for:
 
-- hotness tracking (touch metadata + optional page-protection sampling)
+- hotness tracking (touch metadata + DAMON-based classification)
 - background compression (HOT/WARM/COLD policy)
 - proactive decompression/prefetch (phase hints + simple next-k prefetch)
 
@@ -171,7 +171,7 @@ Pilot workload:
 Example:
 
 ```bash
-./workloads/bin/interactive_burst \
+sudo ./workloads/bin/interactive_burst \
   --duration-sec 20 \
   --region-mb 256 \
   --active-ms 100 \
@@ -181,4 +181,4 @@ Example:
   --arena-autoloops
 ```
 
-See `mem-arena/README.md` for loop flags, stats, and SIGSEGV sampling limitations.
+See `mem-arena/README.md` for loop flags, DAMON requirements, stats, and limitations.
