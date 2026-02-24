@@ -34,6 +34,15 @@ Core calls:
 - `mem_arena_region_free`
 - `mem_arena_destroy`
 
+3-loop prototype calls (pilot):
+
+- `mem_arena_loops_start`
+- `mem_arena_loops_stop`
+- `mem_arena_loops_is_running`
+- `mem_arena_prefetch_chunk`
+- `mem_arena_prefetch_range`
+- `mem_arena_phase_hint`
+
 ## Build
 
 ```bash
@@ -87,6 +96,38 @@ Example:
   --arena-stats-json /tmp/anon_stats.json
 ```
 
+### 3-Loop Pilot (`interactive_burst`)
+
+`interactive_burst` now supports a correctness-first `mem-arena` pilot mode with:
+
+- hotness tracking loop (explicit touches + page-protection sampling)
+- background compression loop
+- proactive prefetch loop (phase hint + next-k prefetch)
+
+Pilot flags:
+
+- `--arena-autoloops`
+- `--arena-t-cold-ms <n>`
+- `--arena-prefetch-distance <n>`
+- `--arena-prefetch-batch <n>`
+- `--arena-disable-prefetch`
+- `--arena-disable-bg-compress`
+
+Example (idle-heavy, easier to observe loop activity):
+
+```bash
+./workloads/bin/interactive_burst \
+  --duration-sec 8 \
+  --region-mb 8 \
+  --active-ms 20 \
+  --idle-ms 500 \
+  --use-mem-arena \
+  --arena-cap-mb 8 \
+  --arena-autoloops \
+  --arena-t-cold-ms 100 \
+  --compress-policy external
+```
+
 ## Stats
 
 - `logical_input_bytes`
@@ -107,6 +148,13 @@ Example:
 - `access_hits_raw`
 - `access_hits_decompressed`
 - `compression_reject_small_gain` (subset: rejected due to savings threshold)
+- 3-loop pilot stats:
+  - `hotness_epoch`, `chunks_hot`, `chunks_warm`, `chunks_cold`
+  - `sampling_pages_armed`, `sampling_faults_total`, `sampling_faults_dropped`
+  - `bg_compress_attempts`, `bg_compress_admits`, `bg_compress_skipped_*`
+  - `prefetch_queue_enqueues`, `prefetch_queue_dedup_skips`, `prefetch_decompress_ops`
+  - `demand_decompress_stall_events`, `demand_decompress_stall_ns_total`
+  - `adaptive_t_cold_epochs_current`
 
 These are designed to feed your fairness model and early-decompression policy ideas.
 
@@ -190,3 +238,4 @@ The measured process is the benchmark process itself (managed test process path)
 - Managed-buffer scope only (not transparent process-wide memory interception).
 - Memory reclaim hints (`madvise`) are best effort and kernel-dependent.
 - LZ4 is the only codec in this phase.
+- 3-loop pilot sampling uses a process-global `SIGSEGV` handler for mem-arena-managed pages and is research-grade / invasive (not production-safe).

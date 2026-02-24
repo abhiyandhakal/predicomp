@@ -118,6 +118,8 @@ Memory-like workloads that support direct integration with `mem-arena` and contr
 - `bin/random_touch_heap`
 - `bin/mmap_churn` (hybrid mode: real mmap churn + sidecar mem-arena compression target)
 
+`bin/interactive_burst` also supports a `mem-arena` internal 3-loop pilot mode (hotness/compress/prefetch) via `--arena-autoloops` for correctness-first experimentation.
+
 Shared flags:
 
 - `--use-mem-arena`
