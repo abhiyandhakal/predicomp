@@ -1386,22 +1386,26 @@ int mem_arena_loops_start(struct mem_arena *arena, const struct mem_arena_loops_
             mem_arena_lock(arena);
             arena->stats.damon_setup_failures++;
             mem_arena_unlock(arena);
+            fprintf(stderr, "mem_arena: DAMON setup failed (need root, exclusive DAMON admin, and matching sysfs layout)\n");
             mem_arena_loops_stop(arena);
             return -1;
         }
     }
     if (arena->loops_cfg.enable_hotness_loop &&
         pthread_create(&arena->hotness_thread, NULL, hotness_loop_main, arena) != 0) {
+        perror("mem_arena: pthread_create(hotness_thread)");
         mem_arena_loops_stop(arena);
         return -1;
     }
     if (arena->loops_cfg.enable_compression_loop &&
         pthread_create(&arena->compression_thread, NULL, compression_loop_main, arena) != 0) {
+        perror("mem_arena: pthread_create(compression_thread)");
         mem_arena_loops_stop(arena);
         return -1;
     }
     if (arena->loops_cfg.enable_prefetch_loop &&
         pthread_create(&arena->prefetch_thread, NULL, prefetch_loop_main, arena) != 0) {
+        perror("mem_arena: pthread_create(prefetch_thread)");
         mem_arena_loops_stop(arena);
         return -1;
     }

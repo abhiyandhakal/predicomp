@@ -88,14 +88,21 @@ static int is_numeric_name(const char *name)
     return 1;
 }
 
-static int ensure_dir_exists(const char *path)
+static int fail_errno(const char *what, const char *path)
 {
-    struct stat st;
-
-    if (stat(path, &st) != 0) {
-        return -1;
+    if (path != NULL) {
+        fprintf(stderr, "mem_arena_damon: %s failed path=%s errno=%d (%s)\n",
+                what,
+                path,
+                errno,
+                strerror(errno));
+    } else {
+        fprintf(stderr, "mem_arena_damon: %s failed errno=%d (%s)\n",
+                what,
+                errno,
+                strerror(errno));
     }
-    return S_ISDIR(st.st_mode) ? 0 : -1;
+    return -1;
 }
 
 static int configure_single_context_target_region(
@@ -115,14 +122,14 @@ static int configure_single_context_target_region(
         return -1;
     }
     if (write_u64_file(path, 1) != 0) {
-        return -1;
+        return fail_errno("write nr_kdamonds", path);
     }
 
     if (path_join(ctx_path, sizeof(ctx_path), DAMON_ADMIN_ROOT, "kdamonds/0/contexts") != 0) {
         return -1;
     }
     if (path_join(path, sizeof(path), ctx_path, "nr_contexts") != 0 || write_u64_file(path, 1) != 0) {
-        return -1;
+        return fail_errno("write nr_contexts", path);
     }
     {
         char tmp[PATH_MAX];
@@ -132,7 +139,7 @@ static int configure_single_context_target_region(
         }
     }
     if (path_join(path, sizeof(path), ctx_path, "operations") != 0 || write_text_file(path, "vaddr") != 0) {
-        return -1;
+        return fail_errno("write operations", path);
     }
 
     if (path_join(attrs_path, sizeof(attrs_path), ctx_path, "monitoring_attrs") != 0) {
@@ -140,30 +147,30 @@ static int configure_single_context_target_region(
     }
     if (path_join(path, sizeof(path), attrs_path, "intervals/sample_us") != 0 ||
         write_u64_file(path, cfg->damon_sample_us ? cfg->damon_sample_us : 5000) != 0) {
-        return -1;
+        return fail_errno("write sample_us", path);
     }
     if (path_join(path, sizeof(path), attrs_path, "intervals/aggr_us") != 0 ||
         write_u64_file(path, cfg->damon_aggr_us ? cfg->damon_aggr_us : 100000) != 0) {
-        return -1;
+        return fail_errno("write aggr_us", path);
     }
     if (path_join(path, sizeof(path), attrs_path, "intervals/update_us") != 0 ||
         write_u64_file(path, cfg->damon_update_us ? cfg->damon_update_us : 1000000) != 0) {
-        return -1;
+        return fail_errno("write update_us", path);
     }
     if (path_join(path, sizeof(path), attrs_path, "nr_regions/min") != 0 ||
         write_u64_file(path, cfg->damon_nr_regions_min ? cfg->damon_nr_regions_min : 10) != 0) {
-        return -1;
+        return fail_errno("write nr_regions/min", path);
     }
     if (path_join(path, sizeof(path), attrs_path, "nr_regions/max") != 0 ||
         write_u64_file(path, cfg->damon_nr_regions_max ? cfg->damon_nr_regions_max : 1000) != 0) {
-        return -1;
+        return fail_errno("write nr_regions/max", path);
     }
 
     if (path_join(target_path, sizeof(target_path), ctx_path, "targets") != 0) {
         return -1;
     }
     if (path_join(path, sizeof(path), target_path, "nr_targets") != 0 || write_u64_file(path, 1) != 0) {
-        return -1;
+        return fail_errno("write nr_targets", path);
     }
     {
         char tmp[PATH_MAX];
@@ -173,23 +180,23 @@ static int configure_single_context_target_region(
         }
     }
     if (path_join(path, sizeof(path), target_path, "pid_target") != 0 || write_u64_file(path, (uint64_t)pid) != 0) {
-        return -1;
+        return fail_errno("write pid_target", path);
     }
     if (path_join(path, sizeof(path), target_path, "regions/nr_regions") != 0 || write_u64_file(path, 1) != 0) {
-        return -1;
+        return fail_errno("write target regions/nr_regions", path);
     }
     if (path_join(path, sizeof(path), target_path, "regions/0/start") != 0 || write_u64_file(path, region_start) != 0) {
-        return -1;
+        return fail_errno("write target region start", path);
     }
     if (path_join(path, sizeof(path), target_path, "regions/0/end") != 0 || write_u64_file(path, region_end) != 0) {
-        return -1;
+        return fail_errno("write target region end", path);
     }
 
     if (path_join(scheme_path, sizeof(scheme_path), ctx_path, "schemes") != 0) {
         return -1;
     }
     if (path_join(path, sizeof(path), scheme_path, "nr_schemes") != 0 || write_u64_file(path, 1) != 0) {
-        return -1;
+        return fail_errno("write nr_schemes", path);
     }
     {
         char tmp[PATH_MAX];
@@ -201,50 +208,44 @@ static int configure_single_context_target_region(
 
     if (path_join(path, sizeof(path), scheme_path, "access_pattern/sz/min") != 0 ||
         write_u64_file(path, 1) != 0) {
-        return -1;
+        return fail_errno("write access_pattern sz/min", path);
     }
     if (path_join(path, sizeof(path), scheme_path, "access_pattern/sz/max") != 0 ||
         write_u64_file(path, region_end > region_start ? (region_end - region_start) : 1) != 0) {
-        return -1;
+        return fail_errno("write access_pattern sz/max", path);
     }
     if (path_join(path, sizeof(path), scheme_path, "access_pattern/nr_accesses/min") != 0 ||
         write_u64_file(path, 0) != 0) {
-        return -1;
+        return fail_errno("write access_pattern nr_accesses/min", path);
     }
     if (path_join(path, sizeof(path), scheme_path, "access_pattern/nr_accesses/max") != 0 ||
         write_u64_file(path, UINT32_MAX) != 0) {
-        return -1;
+        return fail_errno("write access_pattern nr_accesses/max", path);
     }
     if (path_join(path, sizeof(path), scheme_path, "access_pattern/age/min") != 0 ||
         write_u64_file(path, 0) != 0) {
-        return -1;
+        return fail_errno("write access_pattern age/min", path);
     }
     if (path_join(path, sizeof(path), scheme_path, "access_pattern/age/max") != 0 ||
         write_u64_file(path, UINT32_MAX) != 0) {
-        return -1;
+        return fail_errno("write access_pattern age/max", path);
     }
     if (path_join(path, sizeof(path), scheme_path, "action") != 0 || write_text_file(path, "stat") != 0) {
-        return -1;
+        return fail_errno("write scheme action", path);
     }
     if (path_join(path, sizeof(path), scheme_path, "apply_interval_us") != 0 ||
         write_u64_file(path, cfg->damon_aggr_us ? cfg->damon_aggr_us : 100000) != 0) {
-        return -1;
-    }
-    if (path_join(path, sizeof(path), scheme_path, "tried_regions") != 0) {
-        return -1;
-    }
-    if (ensure_dir_exists(path) != 0) {
-        return -1;
+        return fail_errno("write apply_interval_us", path);
     }
 
     if (path_join(path, sizeof(path), DAMON_ADMIN_ROOT, "kdamonds/0/state") != 0) {
         return -1;
     }
     if (write_text_file(path, "commit") != 0) {
-        return -1;
+        return fail_errno("write state=commit", path);
     }
     if (write_text_file(path, "on") != 0) {
-        return -1;
+        return fail_errno("write state=on", path);
     }
 
     return 0;
@@ -270,11 +271,11 @@ int mem_arena_damon_setup(
         return -1;
     }
     if (read_u64_file(path, &nr_kdamonds) != 0) {
-        return -1;
+        return fail_errno("read nr_kdamonds", path);
     }
     if (nr_kdamonds != 0) {
         errno = EBUSY;
-        return -1;
+        return fail_errno("nr_kdamonds busy", path);
     }
 
     if (configure_single_context_target_region(pid, region_start, region_end, cfg) != 0) {
@@ -387,14 +388,17 @@ int mem_arena_damon_poll_snapshot(
     damon->last_poll_ns = now_ns;
 
     if (write_text_file(DAMON_ADMIN_ROOT "/kdamonds/0/state", "update_schemes_tried_regions") != 0) {
-        return -1;
+        return fail_errno("write state=update_schemes_tried_regions",
+                          DAMON_ADMIN_ROOT "/kdamonds/0/state");
     }
     if (list_tried_regions(out_snapshot) != 0) {
-        return -1;
+        return fail_errno("read tried_regions",
+                          DAMON_ADMIN_ROOT "/kdamonds/0/contexts/0/schemes/0/tried_regions");
     }
     if (write_text_file(DAMON_ADMIN_ROOT "/kdamonds/0/state", "clear_schemes_tried_regions") != 0) {
         mem_arena_damon_snapshot_free(out_snapshot);
-        return -1;
+        return fail_errno("write state=clear_schemes_tried_regions",
+                          DAMON_ADMIN_ROOT "/kdamonds/0/state");
     }
 
     return 0;
