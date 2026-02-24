@@ -109,6 +109,10 @@ See `workloads/README.md` for build/run commands, safety guardrails, and citatio
 
 ## 10s Post-Exec Compression Controller (Research Prototype)
 
+Status: archived/secondary for now. This remains in-repo as a prior control-plane
+prototype and observability reference. Current experiments focus on internal
+`mem-arena` autoloops (`interactive_burst`).
+
 Use `./workload_controller` plus `proc_lifecycle` eBPF events to:
 
 - track process `exec`/`exit`/`fork` in userspace
@@ -174,8 +178,7 @@ Example:
   --idle-ms 400 \
   --use-mem-arena \
   --arena-cap-mb 128 \
-  --arena-autoloops \
-  --compress-policy external
+  --arena-autoloops
 ```
 
 See `mem-arena/README.md` for loop flags, stats, and SIGSEGV sampling limitations.

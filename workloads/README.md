@@ -111,14 +111,14 @@ All binaries support strict defaults and common flags:
 
 ## Optional swap-free mem-arena mode
 
-Memory-like workloads that support direct integration with `mem-arena` and controller-triggered compression:
+Memory-like workloads that support direct integration with `mem-arena`:
 
 - `bin/anon_streamer`
 - `bin/interactive_burst`
 - `bin/random_touch_heap`
 - `bin/mmap_churn` (hybrid mode: real mmap churn + sidecar mem-arena compression target)
 
-`bin/interactive_burst` also supports a `mem-arena` internal 3-loop pilot mode (hotness/compress/prefetch) via `--arena-autoloops` for correctness-first experimentation.
+`bin/interactive_burst` is the current recommended `mem-arena` pilot workload and supports an internal 3-loop mode (hotness/compress/prefetch) via `--arena-autoloops`.
 
 Shared flags:
 
@@ -127,11 +127,14 @@ Shared flags:
 - `--arena-min-savings-pct <n>`
 - `--arena-stats-json <path>`
 
-External controller integration flags (for the mem-arena-enabled workloads above):
+`interactive_burst` (internal-only pilot) also supports:
 
-- `--controller-enroll` (requires `--use-mem-arena`)
-- `--controller-sock <path>` (default `/tmp/predicomp-controller.sock`)
-- `--compress-policy internal|external|both` (default `internal`)
+- `--arena-autoloops`
+- `--arena-t-cold-ms <n>`
+- `--arena-prefetch-distance <n>`
+- `--arena-prefetch-batch <n>`
+- `--arena-disable-prefetch`
+- `--arena-disable-bg-compress`
 
 Examples:
 
@@ -142,26 +145,34 @@ Examples:
 ./workloads/bin/mmap_churn --duration-sec 30 --map-kb 512 --ops-per-sec 500 --use-mem-arena --arena-region-mb 128 --arena-cap-mb 128
 ```
 
-Controller-driven external compression example (10s policy is configured in the controller, not the workload):
+Recommended internal 3-loop pilot example (`interactive_burst`):
 
 ```bash
-sudo ./workload_controller --delay-sec 10 --csv /tmp/workload_controller.csv
-
-./workloads/bin/anon_streamer \
-  --duration-sec 30 \
-  --region-mb 512 \
+./workloads/bin/interactive_burst \
+  --duration-sec 20 \
+  --region-mb 256 \
+  --active-ms 100 \
+  --idle-ms 400 \
   --use-mem-arena \
-  --arena-cap-mb 256 \
-  --controller-enroll \
-  --compress-policy external
+  --arena-cap-mb 128 \
+  --arena-autoloops
 ```
 
 See `mem-arena/README.md` for arena architecture and metric definitions.
 For formal per-process RAM before/after compression + compressor CPU accounting,
 use `mem-arena/process_mem_bench`.
+
+### Archived external controller path (kept for reference)
+
+The `workload_controller` + `proc_lifecycle` eBPF path is kept in-repo as an
+earlier prototype for external timing/control experiments. It is not the current
+primary workflow for `mem-arena` research.
+
 See `controller/README.md` for the lifecycle probe + PID tracking controller details.
 
 ## Controller Matrix Runner (All Workloads)
+
+Status: archived/secondary while internal `mem-arena` autoloops are the primary focus.
 
 Run the full workload suite against a fresh controller instance per workload:
 

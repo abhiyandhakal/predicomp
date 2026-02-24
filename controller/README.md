@@ -1,5 +1,9 @@
 # workload_controller: 10s post-exec compression controller (research prototype)
 
+Status: archived/secondary for now. This prototype is kept in-repo for
+reference and observability experiments, while current `mem-arena` work focuses
+on internal autoloops (`interactive_burst`).
+
 This controller is the first end-to-end bridge between:
 
 - eBPF process lifecycle observation (`sched_process_exec`, `sched_process_exit`, `sched_process_fork`)

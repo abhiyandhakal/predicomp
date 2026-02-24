@@ -124,8 +124,7 @@ Example (idle-heavy, easier to observe loop activity):
   --use-mem-arena \
   --arena-cap-mb 8 \
   --arena-autoloops \
-  --arena-t-cold-ms 100 \
-  --compress-policy external
+  --arena-t-cold-ms 100
 ```
 
 ## Stats
