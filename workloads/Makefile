@@ -35,12 +35,14 @@ $(PROCESS_PAGER_CLIENT_LIB):
 	$(MAKE) -C $(PROCESS_PAGER_DIR) $(notdir $@)
 
 $(BIN_DIR)/interactive_burst: $(PROCESS_PAGER_CLIENT_LIB)
+$(BIN_DIR)/anon_streamer: $(PROCESS_PAGER_CLIENT_LIB)
+$(BIN_DIR)/random_touch_heap: $(PROCESS_PAGER_CLIENT_LIB)
 
 $(BIN_DIR)/%: $(SRC_DIR)/%.c $(SRC_DIR)/common.c $(SRC_DIR)/common.h $(SRC_DIR)/controller_client.c $(SRC_DIR)/controller_client.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) -I$(MEM_ARENA_DIR)/include -I$(MEM_ARENA_DIR)/src -I../controller \
 		-I$(PROCESS_PAGER_DIR)/include -I$(PROCESS_PAGER_DIR)/src \
 		$< $(SRC_DIR)/common.c $(SRC_DIR)/controller_client.c $(MEM_ARENA_SRCS) \
-		$(if $(filter interactive_burst,$*),$(PROCESS_PAGER_CLIENT_LIB),) \
+		$(if $(filter interactive_burst anon_streamer random_touch_heap,$*),$(PROCESS_PAGER_CLIENT_LIB),) \
 		-o $@ $(LDFLAGS) -llz4 -pthread
 
 smoke: all
