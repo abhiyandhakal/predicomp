@@ -8,7 +8,8 @@ What it provides (v1):
 - Sidecar daemon (`predicomp_pager`) using a Unix domain socket protocol
 - `userfaultfd` fd passing (SCM_RIGHTS) from client to daemon
 - UFFD missing fault handling (restore compressed page or zero-fill fallback)
-- UFFD write-protect fault handling (dirty tracking, and compressed-page restore in fallback mode)
+- UFFD write-protect fault handling (dirty tracking)
+- Cooperative client-side eviction RPC (daemon requests local `madvise(MADV_DONTNEED)`)
 - DAMON sysfs polling (`admin` tree) for target access observations
 - Simple in-memory LZ4 compressed page store
 - Counters/logging printed at end of a session
@@ -41,9 +42,11 @@ Notes:
 - DAMON is configured on one contiguous span covering all registered ranges, then observations are filtered back to registered pages.
 - Prototype is intended for anonymous private page ranges.
 - On some kernels, `process_madvise(..., MADV_DONTNEED)` for remote eviction returns `EINVAL`.
-  In that case, the daemon automatically falls back to a WP-only compressed-page mode:
-  it still compresses/tracks pages and restores them on UFFD write-protect faults, but it does
-  not evict the target page contents (so this validates the control/fault loop, not memory savings).
+  In that case, the daemon automatically switches to a cooperative fallback:
+  it asks the client library (running in the target process) to perform local
+  `madvise(MADV_DONTNEED)` on selected pages. This preserves real missing-fault restores.
+- If both remote and cooperative local eviction fail, the daemon can still fall back to a
+  WP-only compressed-page mode for control-loop validation.
 
 ## Run
 
@@ -114,10 +117,11 @@ The daemon prints a session summary with counters such as:
 - UFFD ioctl failures
 - fault service latency totals/max
 
-On kernels using the fallback mode, you should expect:
+On kernels where remote `process_madvise` is unsupported but cooperative eviction works, you
+should expect:
 
 - `process_madvise_fail=1` and `process_madvise_unsupported=1`
-- `compress_wp_only_fallback > 0`
-- `faults_wp > 0`
+- `client_evict_ok > 0`
+- `faults_missing > 0`
 - `restore_ok > 0`
-- `faults_missing = 0` (because pages were not actually evicted)
+- `compress_wp_only_fallback = 0` (or near zero if the cooperative path succeeds consistently)

@@ -11,6 +11,8 @@
 #define PREDICOMP_MSG_STOP 4U
 #define PREDICOMP_MSG_ACK 5U
 #define PREDICOMP_MSG_ERROR 6U
+#define PREDICOMP_MSG_EVICT_REQ 7U
+#define PREDICOMP_MSG_EVICT_ACK 8U
 
 #define PREDICOMP_RANGE_F_ANON_PRIVATE 0x1U
 #define PREDICOMP_RANGE_F_WRITABLE     0x2U
@@ -42,6 +44,8 @@ struct predicomp_msg_start {
     uint32_t reserved;
 };
 
+#define PREDICOMP_START_F_RPC_FD 0x1U
+
 struct predicomp_msg_stop {
     struct predicomp_msg_hdr hdr;
     uint32_t reason;
@@ -59,6 +63,22 @@ struct predicomp_msg_error {
     uint32_t for_type;
     int32_t err_no;
     char message[96];
+};
+
+struct predicomp_msg_evict_req {
+    struct predicomp_msg_hdr hdr;
+    uint64_t addr;
+    uint64_t len;
+    int32_t advice;
+    int32_t reserved;
+};
+
+struct predicomp_msg_evict_ack {
+    struct predicomp_msg_hdr hdr;
+    uint64_t addr;
+    uint64_t len;
+    int32_t status;
+    int32_t err_no;
 };
 
 #endif

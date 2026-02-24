@@ -117,6 +117,8 @@ struct metrics {
     uint64_t uffdio_zeropage_failures;
     uint64_t process_madvise_failures;
     uint64_t process_madvise_unsupported;
+    uint64_t client_evict_success;
+    uint64_t client_evict_failures;
     uint64_t compress_wp_only_fallback;
     uint64_t compress_ns_total;
     uint64_t restore_ns_total;
@@ -128,7 +130,9 @@ struct session {
     int active;
     int stop;
     int client_fd;
+    int rpc_fd;
     int uffd;
+    int evict_client_rpc_mode;
     int pidfd;
     pid_t pid;
     pthread_t fault_thread;
@@ -456,19 +460,24 @@ static int uffd_writeprotect_page(struct session *s, uintptr_t addr, int enable)
     return 0;
 }
 
-static int recv_start_with_fd(int fd, struct predicomp_msg_start *out_msg, int *out_passed_fd)
+static int recv_start_with_fds(int fd, struct predicomp_msg_start *out_msg, int *out_fds, size_t max_fds, size_t *out_nr_fds)
 {
     struct msghdr msg;
     struct iovec iov;
     union {
         struct cmsghdr hdr;
-        unsigned char data[CMSG_SPACE(sizeof(int))];
+        unsigned char data[CMSG_SPACE(sizeof(int) * 4)];
     } cbuf;
     struct cmsghdr *cmsg;
     ssize_t n;
 
     memset(out_msg, 0, sizeof(*out_msg));
-    *out_passed_fd = -1;
+    if (out_nr_fds != NULL) {
+        *out_nr_fds = 0;
+    }
+    for (size_t i = 0; i < max_fds; i++) {
+        out_fds[i] = -1;
+    }
     memset(&msg, 0, sizeof(msg));
     memset(&cbuf, 0, sizeof(cbuf));
 
@@ -500,12 +509,56 @@ static int recv_start_with_fd(int fd, struct predicomp_msg_start *out_msg, int *
     for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
             cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
-            memcpy(out_passed_fd, CMSG_DATA(cmsg), sizeof(int));
+            size_t data_len;
+            size_t nr_fds;
+
+            data_len = cmsg->cmsg_len - CMSG_LEN(0);
+            nr_fds = data_len / sizeof(int);
+            if (nr_fds > max_fds) {
+                nr_fds = max_fds;
+            }
+            memcpy(out_fds, CMSG_DATA(cmsg), nr_fds * sizeof(int));
+            if (out_nr_fds != NULL) {
+                *out_nr_fds = nr_fds;
+            }
             break;
         }
     }
-    if (*out_passed_fd < 0) {
+    if (max_fds == 0 || out_fds[0] < 0) {
         errno = EPROTO;
+        return -1;
+    }
+    return 0;
+}
+
+static int client_evict_page_locked(struct session *s, uintptr_t addr, size_t len)
+{
+    struct predicomp_msg_evict_req req;
+    struct predicomp_msg_evict_ack ack;
+
+    if (s->rpc_fd < 0) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    memset(&req, 0, sizeof(req));
+    req.hdr.type = PREDICOMP_MSG_EVICT_REQ;
+    req.hdr.size = sizeof(req);
+    req.addr = (uint64_t)addr;
+    req.len = (uint64_t)len;
+    req.advice = MADV_DONTNEED;
+    if (send_all(s->rpc_fd, &req, sizeof(req)) != 0) {
+        return -1;
+    }
+    if (recv_full(s->rpc_fd, &ack, sizeof(ack)) != 0) {
+        return -1;
+    }
+    if (ack.hdr.type != PREDICOMP_MSG_EVICT_ACK || ack.hdr.size != sizeof(ack) ||
+        ack.addr != req.addr || ack.len != req.len) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (ack.status != 0) {
+        errno = ack.err_no ? ack.err_no : EIO;
         return -1;
     }
     return 0;
@@ -864,7 +917,7 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
     memcpy(new_blob, compbuf, (size_t)clen);
 
     evict_done = 0;
-    if (!s->evict_wp_only_mode) {
+    if (!s->evict_wp_only_mode && !s->evict_client_rpc_mode) {
         madv_rc = process_madvise_wrap(s->pidfd, (void *)p->addr, PAGE_SZ, MADV_DONTNEED);
         if (madv_rc < 0) {
             int saved_errno;
@@ -880,8 +933,14 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
                 s->logged_process_madvise_errno = 1;
             }
             if (saved_errno == EINVAL || saved_errno == ENOSYS || saved_errno == EOPNOTSUPP) {
-                s->evict_wp_only_mode = 1;
                 s->m.process_madvise_unsupported++;
+                if (s->rpc_fd >= 0) {
+                    s->evict_client_rpc_mode = 1;
+                    log_msg(s,
+                            "predicomp_pager: using client local madvise eviction via rpc fd\n");
+                } else {
+                    s->evict_wp_only_mode = 1;
+                }
             } else {
                 free(new_blob);
                 s->m.compress_evict_failures++;
@@ -892,6 +951,22 @@ static int compress_one_page_locked(struct session *s, struct page_entry *p)
             }
         } else {
             evict_done = 1;
+        }
+    }
+    if (!evict_done && s->evict_client_rpc_mode) {
+        if (client_evict_page_locked(s, p->addr, PAGE_SZ) == 0) {
+            evict_done = 1;
+            s->m.client_evict_success++;
+        } else {
+            s->m.client_evict_failures++;
+            if (!s->evict_wp_only_mode) {
+                log_msg(s,
+                        "predicomp_pager: client eviction failed errno=%d (%s); "
+                        "falling back to wp-only compressed-page mode\n",
+                        errno,
+                        strerror(errno));
+                s->evict_wp_only_mode = 1;
+            }
         }
     }
 
@@ -1001,6 +1076,7 @@ static void dump_metrics(const struct session *s)
             " restore_ok=%" PRIu64 " restore_fail=%" PRIu64
             " uffd_copy_fail=%" PRIu64 " uffd_wp_fail=%" PRIu64 " uffd_zero_fail=%" PRIu64
             " process_madvise_fail=%" PRIu64 " process_madvise_unsupported=%" PRIu64
+            " client_evict_ok=%" PRIu64 " client_evict_fail=%" PRIu64
             " compress_wp_only_fallback=%" PRIu64
             " fault_ns_total=%" PRIu64 " fault_ns_max=%" PRIu64
             " compress_ns_total=%" PRIu64 " restore_ns_total=%" PRIu64 "\n",
@@ -1033,6 +1109,8 @@ static void dump_metrics(const struct session *s)
             m->uffdio_zeropage_failures,
             m->process_madvise_failures,
             m->process_madvise_unsupported,
+            m->client_evict_success,
+            m->client_evict_failures,
             m->compress_wp_only_fallback,
             m->fault_service_ns_total,
             m->fault_service_ns_max,
@@ -1074,6 +1152,10 @@ static void stop_session(struct session *s)
         close(s->client_fd);
         s->client_fd = -1;
     }
+    if (s->rpc_fd >= 0) {
+        close(s->rpc_fd);
+        s->rpc_fd = -1;
+    }
     for (i = 0; i < s->nr_pages; i++) {
         free(s->pages[i].blob);
     }
@@ -1097,6 +1179,7 @@ static void reset_session_for_client(struct session *s, int client_fd)
 {
     memset(s, 0, sizeof(*s));
     s->client_fd = client_fd;
+    s->rpc_fd = -1;
     s->uffd = -1;
     s->pidfd = -1;
     pthread_mutex_init(&s->mu, NULL);
@@ -1206,14 +1289,18 @@ static int handle_client(int client_fd, const struct cfg *daemon_cfg)
 
     {
         struct predicomp_msg_start start_msg;
-        int passed_fd;
+        int passed_fds[2];
+        size_t nr_passed_fds;
 
-        if (recv_start_with_fd(client_fd, &start_msg, &passed_fd) != 0) {
+        if (recv_start_with_fds(client_fd, &start_msg, passed_fds, 2, &nr_passed_fds) != 0) {
             (void)send_error_msg(client_fd, PREDICOMP_MSG_START, errno, "missing or invalid uffd fd");
             destroy_session_struct(&s);
             return -1;
         }
-        s.uffd = passed_fd;
+        s.uffd = passed_fds[0];
+        if ((start_msg.flags & PREDICOMP_START_F_RPC_FD) != 0 && nr_passed_fds >= 2) {
+            s.rpc_fd = passed_fds[1];
+        }
         if (start_runtime(&s) != 0) {
             (void)send_error_msg(client_fd, PREDICOMP_MSG_START, errno, "session start failed");
             stop_session(&s);

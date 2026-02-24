@@ -5,12 +5,14 @@
 #include <fcntl.h>
 #include <linux/userfaultfd.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
@@ -36,6 +38,11 @@ struct predicomp_client {
     int daemon_fd;
     int uffd;
     int started;
+    int rpc_fd;
+    int rpc_peer_fd;
+    int rpc_thread_started;
+    int rpc_stop;
+    pthread_t rpc_thread;
     int enable_wp;
     int enable_missing;
     struct predicomp_range_desc *ranges;
@@ -82,13 +89,13 @@ static int recv_full(int fd, void *buf, size_t len)
     return 0;
 }
 
-static int send_with_fd(int fd, const void *buf, size_t len, int pass_fd)
+static int send_with_fds(int fd, const void *buf, size_t len, const int *pass_fds, size_t nr_fds)
 {
     struct msghdr msg;
     struct iovec iov;
     union {
         struct cmsghdr hdr;
-        unsigned char data[CMSG_SPACE(sizeof(int))];
+        unsigned char data[CMSG_SPACE(sizeof(int) * 2)];
     } cmsgbuf;
     struct cmsghdr *cmsg;
 
@@ -102,17 +109,85 @@ static int send_with_fd(int fd, const void *buf, size_t len, int pass_fd)
     msg.msg_control = cmsgbuf.data;
     msg.msg_controllen = sizeof(cmsgbuf.data);
 
-    cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &pass_fd, sizeof(int));
-    msg.msg_controllen = CMSG_SPACE(sizeof(int));
+    if (nr_fds > 0) {
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int) * nr_fds);
+        memcpy(CMSG_DATA(cmsg), pass_fds, sizeof(int) * nr_fds);
+        msg.msg_controllen = CMSG_SPACE(sizeof(int) * nr_fds);
+    } else {
+        msg.msg_control = NULL;
+        msg.msg_controllen = 0;
+    }
 
     if (sendmsg(fd, &msg, 0) < 0) {
         return -1;
     }
     return 0;
+}
+
+static int addr_in_registered_ranges(struct predicomp_client *client, uint64_t addr, uint64_t len)
+{
+    size_t i;
+
+    if ((addr % PAGE_SIZE) != 0 || (len % PAGE_SIZE) != 0 || len == 0) {
+        return 0;
+    }
+    for (i = 0; i < client->nr_ranges; i++) {
+        uint64_t start;
+        uint64_t end;
+
+        start = client->ranges[i].start;
+        end = start + client->ranges[i].len;
+        if (addr >= start && addr + len <= end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void *rpc_thread_main(void *arg)
+{
+    struct predicomp_client *client;
+
+    client = (struct predicomp_client *)arg;
+    while (!client->rpc_stop) {
+        struct predicomp_msg_hdr hdr;
+
+        if (recv_full(client->rpc_fd, &hdr, sizeof(hdr)) != 0) {
+            break;
+        }
+        if (hdr.type == PREDICOMP_MSG_EVICT_REQ && hdr.size == sizeof(struct predicomp_msg_evict_req)) {
+            struct predicomp_msg_evict_req req;
+            struct predicomp_msg_evict_ack ack;
+            int rc;
+
+            memcpy(&req, &hdr, sizeof(hdr));
+            if (recv_full(client->rpc_fd, ((unsigned char *)&req) + sizeof(hdr), sizeof(req) - sizeof(hdr)) != 0) {
+                break;
+            }
+            memset(&ack, 0, sizeof(ack));
+            ack.hdr.type = PREDICOMP_MSG_EVICT_ACK;
+            ack.hdr.size = sizeof(ack);
+            ack.addr = req.addr;
+            ack.len = req.len;
+            if (!addr_in_registered_ranges(client, req.addr, req.len)) {
+                ack.status = -1;
+                ack.err_no = EINVAL;
+            } else {
+                rc = madvise((void *)(uintptr_t)req.addr, (size_t)req.len, req.advice);
+                ack.status = (rc == 0) ? 0 : -1;
+                ack.err_no = (rc == 0) ? 0 : errno;
+            }
+            if (send_all(client->rpc_fd, &ack, sizeof(ack)) != 0) {
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    return NULL;
 }
 
 static int recv_ack_or_error(int fd, uint32_t expect_type)
@@ -214,6 +289,8 @@ int predicomp_client_open(struct predicomp_client **out_client, const struct pre
     }
     c->daemon_fd = -1;
     c->uffd = -1;
+    c->rpc_fd = -1;
+    c->rpc_peer_fd = -1;
     c->enable_wp = (cfg == NULL) ? 1 : cfg->enable_wp;
     c->enable_missing = (cfg == NULL) ? 1 : cfg->enable_missing;
     c->next_range_id = 1;
@@ -310,6 +387,8 @@ int predicomp_client_start(struct predicomp_client *client)
     size_t i;
     struct predicomp_msg_hello hello;
     struct predicomp_msg_start start_msg;
+    int rpc_pair[2];
+    int pass_fds[2];
 
     if (client == NULL || client->started) {
         errno = EINVAL;
@@ -319,14 +398,28 @@ int predicomp_client_start(struct predicomp_client *client)
         errno = EINVAL;
         return -1;
     }
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, rpc_pair) != 0) {
+        perror("predicomp_client: socketpair");
+        return -1;
+    }
+    client->rpc_fd = rpc_pair[0];
+    client->rpc_peer_fd = rpc_pair[1];
     if (create_uffd(client->enable_wp, client->enable_missing, &client->uffd) != 0) {
         perror("predicomp_client: userfaultfd");
+        close(client->rpc_fd);
+        close(client->rpc_peer_fd);
+        client->rpc_fd = -1;
+        client->rpc_peer_fd = -1;
         return -1;
     }
     if (register_uffd_ranges(client) != 0) {
         perror("predicomp_client: UFFDIO_REGISTER");
         close(client->uffd);
         client->uffd = -1;
+        close(client->rpc_fd);
+        close(client->rpc_peer_fd);
+        client->rpc_fd = -1;
+        client->rpc_peer_fd = -1;
         return -1;
     }
     client->daemon_fd = connect_daemon(client->sock_path);
@@ -334,6 +427,10 @@ int predicomp_client_start(struct predicomp_client *client)
         perror("predicomp_client: connect daemon");
         close(client->uffd);
         client->uffd = -1;
+        close(client->rpc_fd);
+        close(client->rpc_peer_fd);
+        client->rpc_fd = -1;
+        client->rpc_peer_fd = -1;
         return -1;
     }
 
@@ -365,16 +462,35 @@ int predicomp_client_start(struct predicomp_client *client)
     memset(&start_msg, 0, sizeof(start_msg));
     start_msg.hdr.type = PREDICOMP_MSG_START;
     start_msg.hdr.size = sizeof(start_msg);
-    if (send_with_fd(client->daemon_fd, &start_msg, sizeof(start_msg), client->uffd) != 0 ||
+    start_msg.flags = PREDICOMP_START_F_RPC_FD;
+    client->rpc_stop = 0;
+    if (pthread_create(&client->rpc_thread, NULL, rpc_thread_main, client) != 0) {
+        perror("predicomp_client: pthread_create rpc");
+        goto fail;
+    }
+    client->rpc_thread_started = 1;
+    pass_fds[0] = client->uffd;
+    pass_fds[1] = client->rpc_peer_fd;
+    if (send_with_fds(client->daemon_fd, &start_msg, sizeof(start_msg), pass_fds, 2) != 0 ||
         recv_ack_or_error(client->daemon_fd, PREDICOMP_MSG_START) != 0) {
         goto fail;
     }
+    close(client->rpc_peer_fd);
+    client->rpc_peer_fd = -1;
 
     client->started = 1;
     return 0;
 
 fail:
     perror("predicomp_client: daemon handshake");
+    client->rpc_stop = 1;
+    if (client->rpc_fd >= 0) {
+        shutdown(client->rpc_fd, SHUT_RDWR);
+    }
+    if (client->rpc_thread_started) {
+        pthread_join(client->rpc_thread, NULL);
+        client->rpc_thread_started = 0;
+    }
     if (client->daemon_fd >= 0) {
         close(client->daemon_fd);
         client->daemon_fd = -1;
@@ -382,6 +498,14 @@ fail:
     if (client->uffd >= 0) {
         close(client->uffd);
         client->uffd = -1;
+    }
+    if (client->rpc_fd >= 0) {
+        close(client->rpc_fd);
+        client->rpc_fd = -1;
+    }
+    if (client->rpc_peer_fd >= 0) {
+        close(client->rpc_peer_fd);
+        client->rpc_peer_fd = -1;
     }
     return -1;
 }
@@ -402,6 +526,14 @@ int predicomp_client_stop(struct predicomp_client *client)
     stop_msg.hdr.size = sizeof(stop_msg);
     (void)send_all(client->daemon_fd, &stop_msg, sizeof(stop_msg));
     client->started = 0;
+    client->rpc_stop = 1;
+    if (client->rpc_fd >= 0) {
+        shutdown(client->rpc_fd, SHUT_RDWR);
+    }
+    if (client->rpc_thread_started) {
+        pthread_join(client->rpc_thread, NULL);
+        client->rpc_thread_started = 0;
+    }
     if (client->daemon_fd >= 0) {
         close(client->daemon_fd);
         client->daemon_fd = -1;
@@ -409,6 +541,14 @@ int predicomp_client_stop(struct predicomp_client *client)
     if (client->uffd >= 0) {
         close(client->uffd);
         client->uffd = -1;
+    }
+    if (client->rpc_fd >= 0) {
+        close(client->rpc_fd);
+        client->rpc_fd = -1;
+    }
+    if (client->rpc_peer_fd >= 0) {
+        close(client->rpc_peer_fd);
+        client->rpc_peer_fd = -1;
     }
     return 0;
 }
