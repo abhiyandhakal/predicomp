@@ -139,10 +139,7 @@ stable anonymous private writable regions in these workloads:
 - `bin/interactive_burst`
 - `bin/anon_streamer`
 - `bin/random_touch_heap`
-
-Deferred (not yet supported for actual pages):
-
-- `bin/mmap_churn` (needs dynamic range register/unregister for churned mappings)
+- `bin/mmap_churn` (dynamic live range register/unregister on churned mappings)
 
 Out of scope for the current process-pager prototype:
 
@@ -197,6 +194,21 @@ Example (`random_touch_heap`):
   --use-process-pager \
   --pager-sock /tmp/predicomp-pager.sock
 ```
+
+Example (`mmap_churn`, actual churned mappings):
+
+```bash
+./workloads/bin/mmap_churn \
+  --duration-sec 20 \
+  --map-kb 512 \
+  --ops-per-sec 300 \
+  --use-process-pager \
+  --pager-sock /tmp/predicomp-pager.sock
+```
+
+`mmap_churn` now uses runtime live range add/del for each `mmap`/`munmap` pair.
+Because mappings are short-lived, compression can legitimately stay near zero
+while fault counts are high (UFFD missing faults on newly registered pages).
 
 `interactive_burst` (internal-only pilot) also supports:
 

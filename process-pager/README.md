@@ -2,9 +2,10 @@
 
 Cooperative userspace process pager prototype for `predicomp` research.
 
-What it provides (v1):
+What it provides (current prototype):
 
 - Cooperative client library (`libpredicomp_client.a`) for explicit range registration
+- Runtime live range add/del after session start (for churned mappings)
 - Sidecar daemon (`predicomp_pager`) using a Unix domain socket protocol
 - `userfaultfd` fd passing (SCM_RIGHTS) from client to daemon
 - UFFD missing fault handling (restore compressed page or zero-fill fallback)
@@ -97,14 +98,30 @@ Example compile linkage (adjust include/library paths):
 cc -O2 -g demo.c -Iprocess-pager/include process-pager/libpredicomp_client.a -o demo
 ```
 
-## Protocol Summary (v1)
+## Protocol Summary (current)
 
 1. Client connects to Unix socket.
 2. Client sends `HELLO` (pid + range count).
 3. Client sends one `RANGE` message per registered range.
 4. Client sends `START` and passes `userfaultfd` via SCM_RIGHTS.
 5. Daemon acks and begins fault handling/background compression.
-6. Client sends `STOP` (or disconnects) to end the session.
+6. (Optional) Client sends runtime `RANGE_ADD` / `RANGE_DEL` messages (used by `mmap_churn`).
+7. Client sends `STOP` (or disconnects) to end the session.
+
+### Dynamic ranges (`mmap_churn`)
+
+`mmap_churn` uses the live range APIs to register each short-lived anonymous
+mapping after `mmap()` and unregister it before `munmap()`.
+
+This validates:
+
+- runtime protocol updates (`RANGE_ADD`/`RANGE_DEL`)
+- `userfaultfd` registration/unregistration on churned mappings
+- daemon page/range bookkeeping under churn
+
+Compression can remain low or zero for `mmap_churn` with default settings
+because mappings are often unmapped before they become cold enough for the
+background compressor.
 
 ## What To Observe
 

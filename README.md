@@ -123,7 +123,7 @@ See `workloads/README.md` for build/run commands, safety guardrails, and citatio
 Cooperative `process-pager` coverage (actual workload pages, VM-first):
 
 - supported: `interactive_burst`, `anon_streamer`, `random_touch_heap`
-- deferred: `mmap_churn` (needs dynamic range register/unregister)
+- supported (dynamic live ranges): `mmap_churn`
 - out of scope: fork workloads (`fork_exit_storm`, `fork_touch_exit`, `fork_exec_storm`)
 
 ## 10s Post-Exec Compression Controller (Research Prototype)
