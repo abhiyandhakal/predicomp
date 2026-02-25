@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define PREDICOMP_PAGER_PROTO_VERSION 1U
+#define PREDICOMP_PAGER_PROTO_VERSION 2U
 
 #define PREDICOMP_MSG_HELLO 1U
 #define PREDICOMP_MSG_RANGE 2U
@@ -13,6 +13,8 @@
 #define PREDICOMP_MSG_ERROR 6U
 #define PREDICOMP_MSG_EVICT_REQ 7U
 #define PREDICOMP_MSG_EVICT_ACK 8U
+#define PREDICOMP_MSG_RANGE_ADD 9U
+#define PREDICOMP_MSG_RANGE_DEL 10U
 
 #define PREDICOMP_RANGE_F_ANON_PRIVATE 0x1U
 #define PREDICOMP_RANGE_F_WRITABLE     0x2U
@@ -34,6 +36,22 @@ struct predicomp_msg_range {
     struct predicomp_msg_hdr hdr;
     uint32_t range_id;
     uint32_t flags;
+    uint64_t start;
+    uint64_t len;
+};
+
+struct predicomp_msg_range_add {
+    struct predicomp_msg_hdr hdr;
+    uint32_t range_id;
+    uint32_t flags;
+    uint64_t start;
+    uint64_t len;
+};
+
+struct predicomp_msg_range_del {
+    struct predicomp_msg_hdr hdr;
+    uint32_t range_id;
+    uint32_t reserved;
     uint64_t start;
     uint64_t len;
 };

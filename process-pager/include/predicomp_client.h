@@ -34,6 +34,19 @@ int predicomp_client_register_range(
     struct predicomp_range_handle *out_handle
 );
 
+int predicomp_client_register_range_live(
+    struct predicomp_client *client,
+    void *addr,
+    size_t len,
+    uint32_t flags,
+    struct predicomp_range_handle *out_handle
+);
+
+int predicomp_client_unregister_range_live(
+    struct predicomp_client *client,
+    const struct predicomp_range_handle *handle
+);
+
 int predicomp_client_start(struct predicomp_client *client);
 int predicomp_client_stop(struct predicomp_client *client);
 void predicomp_client_close(struct predicomp_client *client);

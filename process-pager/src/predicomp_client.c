@@ -43,6 +43,7 @@ struct predicomp_client {
     int rpc_thread_started;
     int rpc_stop;
     pthread_t rpc_thread;
+    pthread_mutex_t mu;
     int enable_wp;
     int enable_missing;
     struct predicomp_range_desc *ranges;
@@ -50,6 +51,107 @@ struct predicomp_client {
     size_t ranges_cap;
     uint32_t next_range_id;
 };
+
+static int send_all(int fd, const void *buf, size_t len);
+static int recv_ack_or_error(int fd, uint32_t expect_type);
+
+static int ensure_ranges_cap(struct predicomp_client *client, size_t need)
+{
+    void *tmp;
+    size_t new_cap;
+
+    if (need <= client->ranges_cap) {
+        return 0;
+    }
+    new_cap = client->ranges_cap == 0 ? 4 : client->ranges_cap;
+    while (new_cap < need) {
+        new_cap *= 2;
+    }
+    tmp = realloc(client->ranges, new_cap * sizeof(*client->ranges));
+    if (tmp == NULL) {
+        return -1;
+    }
+    client->ranges = tmp;
+    client->ranges_cap = new_cap;
+    return 0;
+}
+
+static ssize_t find_range_index_by_id(const struct predicomp_client *client, uint32_t id)
+{
+    size_t i;
+
+    for (i = 0; i < client->nr_ranges; i++) {
+        if (client->ranges[i].id == id) {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+static int uffd_register_one(struct predicomp_client *client, const struct predicomp_range_desc *r)
+{
+    struct uffdio_register reg;
+
+    memset(&reg, 0, sizeof(reg));
+    reg.range.start = r->start;
+    reg.range.len = r->len;
+    if (client->enable_missing) {
+        reg.mode |= UFFDIO_REGISTER_MODE_MISSING;
+    }
+    if (client->enable_wp) {
+        reg.mode |= UFFDIO_REGISTER_MODE_WP;
+    }
+    if (ioctl(client->uffd, UFFDIO_REGISTER, &reg) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int uffd_unregister_one(struct predicomp_client *client, uint64_t start, uint64_t len)
+{
+    struct uffdio_range range;
+
+    memset(&range, 0, sizeof(range));
+    range.start = start;
+    range.len = len;
+    if (ioctl(client->uffd, UFFDIO_UNREGISTER, &range) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int send_range_add_and_wait_ack(struct predicomp_client *client, const struct predicomp_range_desc *r)
+{
+    struct predicomp_msg_range_add msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.type = PREDICOMP_MSG_RANGE_ADD;
+    msg.hdr.size = sizeof(msg);
+    msg.range_id = r->id;
+    msg.flags = r->flags;
+    msg.start = r->start;
+    msg.len = r->len;
+    if (send_all(client->daemon_fd, &msg, sizeof(msg)) != 0) {
+        return -1;
+    }
+    return recv_ack_or_error(client->daemon_fd, PREDICOMP_MSG_RANGE_ADD);
+}
+
+static int send_range_del_and_wait_ack(struct predicomp_client *client, const struct predicomp_range_desc *r)
+{
+    struct predicomp_msg_range_del msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.type = PREDICOMP_MSG_RANGE_DEL;
+    msg.hdr.size = sizeof(msg);
+    msg.range_id = r->id;
+    msg.start = r->start;
+    msg.len = r->len;
+    if (send_all(client->daemon_fd, &msg, sizeof(msg)) != 0) {
+        return -1;
+    }
+    return recv_ack_or_error(client->daemon_fd, PREDICOMP_MSG_RANGE_DEL);
+}
 
 static int send_all(int fd, const void *buf, size_t len)
 {
@@ -294,6 +396,7 @@ int predicomp_client_open(struct predicomp_client **out_client, const struct pre
     c->enable_wp = (cfg == NULL) ? 1 : cfg->enable_wp;
     c->enable_missing = (cfg == NULL) ? 1 : cfg->enable_missing;
     c->next_range_id = 1;
+    pthread_mutex_init(&c->mu, NULL);
     *out_client = c;
     return 0;
 }
@@ -316,14 +419,8 @@ int predicomp_client_register_range(struct predicomp_client *client, void *addr,
         errno = EINVAL;
         return -1;
     }
-    if (client->nr_ranges == client->ranges_cap) {
-        size_t new_cap = client->ranges_cap == 0 ? 4 : client->ranges_cap * 2;
-        void *tmp = realloc(client->ranges, new_cap * sizeof(*client->ranges));
-        if (tmp == NULL) {
-            return -1;
-        }
-        client->ranges = tmp;
-        client->ranges_cap = new_cap;
+    if (ensure_ranges_cap(client, client->nr_ranges + 1) != 0) {
+        return -1;
     }
     r = &client->ranges[client->nr_ranges++];
     r->start = (uint64_t)start;
@@ -342,17 +439,7 @@ static int register_uffd_ranges(struct predicomp_client *client)
 {
     size_t i;
     for (i = 0; i < client->nr_ranges; i++) {
-        struct uffdio_register reg;
-        memset(&reg, 0, sizeof(reg));
-        reg.range.start = client->ranges[i].start;
-        reg.range.len = client->ranges[i].len;
-        if (client->enable_missing) {
-            reg.mode |= UFFDIO_REGISTER_MODE_MISSING;
-        }
-        if (client->enable_wp) {
-            reg.mode |= UFFDIO_REGISTER_MODE_WP;
-        }
-        if (ioctl(client->uffd, UFFDIO_REGISTER, &reg) != 0) {
+        if (uffd_register_one(client, &client->ranges[i]) != 0) {
             return -1;
         }
     }
@@ -391,10 +478,6 @@ int predicomp_client_start(struct predicomp_client *client)
     int pass_fds[2];
 
     if (client == NULL || client->started) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (client->nr_ranges == 0) {
         errno = EINVAL;
         return -1;
     }
@@ -553,12 +636,120 @@ int predicomp_client_stop(struct predicomp_client *client)
     return 0;
 }
 
+int predicomp_client_register_range_live(
+    struct predicomp_client *client,
+    void *addr,
+    size_t len,
+    uint32_t flags,
+    struct predicomp_range_handle *out_handle
+)
+{
+    struct predicomp_range_desc *r;
+    uint32_t assigned_id;
+    uintptr_t start;
+
+    if (client == NULL || addr == NULL || len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    start = (uintptr_t)addr;
+    if ((start % PAGE_SIZE) != 0 || (len % PAGE_SIZE) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&client->mu);
+    if (!client->started || client->daemon_fd < 0 || client->uffd < 0) {
+        pthread_mutex_unlock(&client->mu);
+        errno = EINVAL;
+        return -1;
+    }
+    if (ensure_ranges_cap(client, client->nr_ranges + 1) != 0) {
+        pthread_mutex_unlock(&client->mu);
+        return -1;
+    }
+    r = &client->ranges[client->nr_ranges];
+    memset(r, 0, sizeof(*r));
+    r->start = (uint64_t)start;
+    r->len = (uint64_t)len;
+    r->flags = flags;
+    r->id = client->next_range_id++;
+    assigned_id = r->id;
+
+    if (uffd_register_one(client, r) != 0) {
+        pthread_mutex_unlock(&client->mu);
+        return -1;
+    }
+    if (send_range_add_and_wait_ack(client, r) != 0) {
+        int saved = errno;
+        (void)uffd_unregister_one(client, r->start, r->len);
+        pthread_mutex_unlock(&client->mu);
+        errno = saved;
+        return -1;
+    }
+    client->nr_ranges++;
+    if (out_handle != NULL) {
+        out_handle->id = (int)assigned_id;
+        out_handle->addr = addr;
+        out_handle->len = len;
+    }
+    pthread_mutex_unlock(&client->mu);
+    return 0;
+}
+
+int predicomp_client_unregister_range_live(
+    struct predicomp_client *client,
+    const struct predicomp_range_handle *handle
+)
+{
+    ssize_t idx;
+    struct predicomp_range_desc r;
+
+    if (client == NULL || handle == NULL || handle->id <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&client->mu);
+    if (!client->started || client->daemon_fd < 0 || client->uffd < 0) {
+        pthread_mutex_unlock(&client->mu);
+        errno = EINVAL;
+        return -1;
+    }
+    idx = find_range_index_by_id(client, (uint32_t)handle->id);
+    if (idx < 0) {
+        pthread_mutex_unlock(&client->mu);
+        errno = ENOENT;
+        return -1;
+    }
+    r = client->ranges[idx];
+    if (send_range_del_and_wait_ack(client, &r) != 0) {
+        int saved = errno;
+        pthread_mutex_unlock(&client->mu);
+        errno = saved;
+        return -1;
+    }
+    if (uffd_unregister_one(client, r.start, r.len) != 0) {
+        pthread_mutex_unlock(&client->mu);
+        return -1;
+    }
+    if ((size_t)idx + 1 < client->nr_ranges) {
+        memmove(&client->ranges[idx],
+                &client->ranges[idx + 1],
+                (client->nr_ranges - ((size_t)idx + 1)) * sizeof(client->ranges[0]));
+    }
+    client->nr_ranges--;
+    pthread_mutex_unlock(&client->mu);
+    return 0;
+}
+
 void predicomp_client_close(struct predicomp_client *client)
 {
     if (client == NULL) {
         return;
     }
     (void)predicomp_client_stop(client);
+    pthread_mutex_destroy(&client->mu);
     free(client->ranges);
     free(client);
 }
