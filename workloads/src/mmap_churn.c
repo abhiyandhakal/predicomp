@@ -2,6 +2,7 @@
 #include "controller_client.h"
 
 #include <mem_arena.h>
+#include <predicomp_client.h>
 
 #include <inttypes.h>
 #include <signal.h>
@@ -135,6 +136,8 @@ static void usage(const char *prog)
     fprintf(stderr, "  --map-kb <n>              bytes per mmap region in KiB (default %d)\n", DEFAULT_MAP_KB);
     fprintf(stderr, "  --ops-per-sec <n>         mmap/munmap ops per second (default %d)\n", DEFAULT_OPS_PER_SEC);
     fprintf(stderr, "  --use-mem-arena           enable sidecar managed compression arena\n");
+    fprintf(stderr, "  --use-process-pager       enable cooperative process-pager on churned mappings\n");
+    fprintf(stderr, "  --pager-sock <path>       process-pager daemon UNIX socket (default /tmp/predicomp-pager.sock)\n");
     fprintf(stderr, "  --arena-region-mb <n>     sidecar arena region size MB (default %d)\n", DEFAULT_ARENA_REGION_MB);
     fprintf(stderr, "  --arena-cap-mb <n>        arena compressed pool MB (default 256)\n");
     fprintf(stderr, "  --arena-min-savings-pct <n> min savings threshold %% (default 5)\n");
@@ -151,12 +154,14 @@ int main(int argc, char **argv)
     int map_kb = DEFAULT_MAP_KB;
     int ops_per_sec = DEFAULT_OPS_PER_SEC;
     int use_mem_arena = 0;
+    int use_process_pager = 0;
     int arena_region_mb = DEFAULT_ARENA_REGION_MB;
     int arena_cap_mb = 256;
     int arena_min_savings_pct = 5;
     const char *arena_stats_json = NULL;
     int controller_enroll = 0;
     const char *controller_sock = NULL;
+    const char *pager_sock = NULL;
     enum compress_policy compress_policy = COMPRESS_POLICY_INTERNAL;
     uint64_t external_compress_triggers = 0;
     uint64_t ops = 0;
@@ -172,9 +177,17 @@ int main(int argc, char **argv)
     size_t sidecar_len = 0;
     size_t sidecar_pages = 0;
     size_t sidecar_page_idx = 0;
+    struct predicomp_client *pager_client = NULL;
+    struct predicomp_client_config pager_cfg;
+    uint64_t pager_range_ops_register = 0;
+    uint64_t pager_range_ops_unregister = 0;
+    uint64_t pager_range_live_failures = 0;
+    uint64_t pager_range_live_peak = 0;
+    uint64_t pager_range_live_cur = 0;
 
     wl_init_common_opts(&common);
     memset(&arena_stats, 0, sizeof(arena_stats));
+    memset(&pager_cfg, 0, sizeof(pager_cfg));
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
@@ -187,6 +200,10 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--use-mem-arena") == 0) {
             use_mem_arena = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--use-process-pager") == 0) {
+            use_process_pager = 1;
             continue;
         }
         if (strcmp(argv[i], "--controller-enroll") == 0) {
@@ -225,6 +242,10 @@ int main(int argc, char **argv)
             controller_sock = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "--pager-sock") == 0) {
+            pager_sock = argv[++i];
+            continue;
+        }
         if (strcmp(argv[i], "--compress-policy") == 0) {
             compress_policy = parse_compress_policy(argv[++i]);
             continue;
@@ -238,6 +259,14 @@ int main(int argc, char **argv)
     }
 
     if (wl_validate_common_opts(&common) != 0) {
+        return 2;
+    }
+    if (use_mem_arena && use_process_pager) {
+        fprintf(stderr, "--use-mem-arena and --use-process-pager are mutually exclusive\n");
+        return 2;
+    }
+    if (pager_sock != NULL && !use_process_pager) {
+        fprintf(stderr, "--pager-sock requires --use-process-pager\n");
         return 2;
     }
     if (controller_enroll && !use_mem_arena) {
@@ -298,25 +327,83 @@ int main(int argc, char **argv)
             }
         }
     }
+    if (use_process_pager) {
+        pager_cfg.daemon_sock_path = pager_sock;
+        pager_cfg.enable_wp = 1;
+        pager_cfg.enable_missing = 1;
+        if (predicomp_client_open(&pager_client, &pager_cfg) != 0) {
+            perror("predicomp_client_open");
+            if (arena != NULL) {
+                mem_arena_destroy(arena);
+            }
+            return 1;
+        }
+        if (predicomp_client_start(pager_client) != 0) {
+            perror("predicomp_client_start");
+            predicomp_client_close(pager_client);
+            if (arena != NULL) {
+                mem_arena_destroy(arena);
+            }
+            return 1;
+        }
+    }
 
     start_ns = wl_now_ns();
     deadline_ns = start_ns + (uint64_t)common.duration_sec * 1000000000ULL;
 
     while (wl_now_ns() < deadline_ns) {
         char *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        struct predicomp_range_handle pager_range;
+        int pager_range_registered = 0;
 
         if (p == MAP_FAILED) {
             perror("mmap");
+            if (pager_client != NULL) {
+                (void)predicomp_client_stop(pager_client);
+                predicomp_client_close(pager_client);
+            }
             if (arena != NULL) {
                 mem_arena_destroy(arena);
             }
             return 1;
         }
+        memset(&pager_range, 0, sizeof(pager_range));
+        if (use_process_pager) {
+            if (predicomp_client_register_range_live(pager_client,
+                                                    p,
+                                                    len,
+                                                    PREDICOMP_CLIENT_RANGE_F_ANON_PRIVATE |
+                                                        PREDICOMP_CLIENT_RANGE_F_WRITABLE,
+                                                    &pager_range) == 0) {
+                pager_range_registered = 1;
+                pager_range_ops_register++;
+                pager_range_live_cur++;
+                if (pager_range_live_cur > pager_range_live_peak) {
+                    pager_range_live_peak = pager_range_live_cur;
+                }
+            } else {
+                pager_range_live_failures++;
+            }
+        }
         for (size_t off = 0; off < len; off += PAGE_SIZE) {
             p[off] = (char)(off & 0xff);
         }
+        if (use_process_pager && pager_range_registered) {
+            if (predicomp_client_unregister_range_live(pager_client, &pager_range) == 0) {
+                pager_range_ops_unregister++;
+                if (pager_range_live_cur > 0) {
+                    pager_range_live_cur--;
+                }
+            } else {
+                pager_range_live_failures++;
+            }
+        }
         if (munmap(p, len) != 0) {
             perror("munmap");
+            if (pager_client != NULL) {
+                (void)predicomp_client_stop(pager_client);
+                predicomp_client_close(pager_client);
+            }
             if (arena != NULL) {
                 mem_arena_destroy(arena);
             }
@@ -382,6 +469,16 @@ int main(int argc, char **argv)
         wl_print_json_kv_u64("ops", ops, false);
         wl_print_json_kv_u64("map_kb", (uint64_t)map_kb, false);
         wl_print_json_kv_u64("use_mem_arena", (uint64_t)use_mem_arena, false);
+        wl_print_json_kv_u64("use_process_pager", (uint64_t)use_process_pager, false);
+        if (use_process_pager) {
+            wl_print_json_kv_str("pager_sock",
+                                 pager_sock != NULL ? pager_sock : "/tmp/predicomp-pager.sock",
+                                 false);
+            wl_print_json_kv_u64("pager_range_ops_register", pager_range_ops_register, false);
+            wl_print_json_kv_u64("pager_range_ops_unregister", pager_range_ops_unregister, false);
+            wl_print_json_kv_u64("pager_range_live_peak", pager_range_live_peak, false);
+            wl_print_json_kv_u64("pager_range_live_failures", pager_range_live_failures, false);
+        }
         if (use_mem_arena) {
             wl_print_json_kv_u64("arena_region_mb", (uint64_t)arena_region_mb, false);
         }
@@ -395,13 +492,23 @@ int main(int argc, char **argv)
         wl_print_json_kv_double("elapsed_ms", elapsed_ms, true);
         printf("}\n");
     } else {
-        printf("mmap_churn map_kb=%d ops_per_sec=%d duration_sec=%d ops=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d",
+        printf("mmap_churn map_kb=%d ops_per_sec=%d duration_sec=%d ops=%" PRIu64 " elapsed_ms=%.3f use_mem_arena=%d use_process_pager=%d",
                map_kb,
                ops_per_sec,
                common.duration_sec,
                ops,
                elapsed_ms,
-               use_mem_arena);
+               use_mem_arena,
+               use_process_pager);
+        if (use_process_pager) {
+            printf(" pager_sock=%s pager_range_ops_register=%" PRIu64 " pager_range_ops_unregister=%" PRIu64
+                   " pager_range_live_peak=%" PRIu64 " pager_range_live_failures=%" PRIu64,
+                   pager_sock != NULL ? pager_sock : "/tmp/predicomp-pager.sock",
+                   pager_range_ops_register,
+                   pager_range_ops_unregister,
+                   pager_range_live_peak,
+                   pager_range_live_failures);
+        }
         if (use_mem_arena) {
             printf(" arena_region_mb=%d", arena_region_mb);
         }
@@ -415,6 +522,11 @@ int main(int argc, char **argv)
                    arena_stats.evictions_lru);
         }
         printf("\n");
+    }
+
+    if (pager_client != NULL) {
+        (void)predicomp_client_stop(pager_client);
+        predicomp_client_close(pager_client);
     }
 
     if (use_mem_arena) {
