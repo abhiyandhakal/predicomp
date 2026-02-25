@@ -41,6 +41,11 @@ All binaries support strict defaults and common flags:
 
 ### Workload catalog
 
+Note:
+- `fork_exit_storm`, `fork_touch_exit`, and `fork_exec_storm` are kept in `workloads/src/`
+  but currently commented out in `workloads/Makefile` (`TARGETS` / `smoke`) because they are
+  not applicable to the cooperative single-target process-pager path.
+
 ### 1) `bin/fork_exit_storm`
 - Intent: process lifecycle churn with minimal memory work.
 - Good for: validating fork trace volume and scheduler pressure.

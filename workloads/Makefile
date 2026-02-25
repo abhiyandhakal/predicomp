@@ -14,9 +14,9 @@ MEM_ARENA_SRCS := \
 PROCESS_PAGER_CLIENT_LIB := $(PROCESS_PAGER_DIR)/libpredicomp_client.a
 
 TARGETS := \
-	fork_exit_storm \
-	fork_touch_exit \
-	fork_exec_storm \
+	# fork_exit_storm \
+	# fork_touch_exit \
+	# fork_exec_storm \
 	interactive_burst \
 	mmap_churn \
 	anon_streamer \
@@ -47,9 +47,11 @@ $(BIN_DIR)/%: $(SRC_DIR)/%.c $(SRC_DIR)/common.c $(SRC_DIR)/common.h $(SRC_DIR)/
 		-o $@ $(LDFLAGS) -llz4 -pthread
 
 smoke: all
-	./$(BIN_DIR)/fork_exit_storm --duration-sec 1 --workers 1 --fork-rate 5
-	./$(BIN_DIR)/fork_touch_exit --duration-sec 1 --workers 1 --fork-rate 3 --touch-pages 8
-	./$(BIN_DIR)/fork_exec_storm --duration-sec 1 --workers 1 --fork-rate 2
+	# Fork workloads are intentionally commented out of TARGETS/smoke by default:
+	# they are not applicable to the cooperative single-target process-pager path.
+	# ./$(BIN_DIR)/fork_exit_storm --duration-sec 1 --workers 1 --fork-rate 5
+	# ./$(BIN_DIR)/fork_touch_exit --duration-sec 1 --workers 1 --fork-rate 3 --touch-pages 8
+	# ./$(BIN_DIR)/fork_exec_storm --duration-sec 1 --workers 1 --fork-rate 2
 	./$(BIN_DIR)/interactive_burst --duration-sec 1 --region-mb 8 --active-ms 10 --idle-ms 10
 	./$(BIN_DIR)/mmap_churn --duration-sec 1 --map-kb 64 --ops-per-sec 10
 	./$(BIN_DIR)/anon_streamer --duration-sec 1 --region-mb 8 --idle-ms 10
