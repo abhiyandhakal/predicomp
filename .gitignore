@@ -6,5 +6,6 @@ src/*.o
 src/*.skel.h
 workload_controller
 workloads/results/controller-matrix/
+workloads/results/process-pager-ab-repeats/
 vm/images/
 vm/run/
