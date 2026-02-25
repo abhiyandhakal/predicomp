@@ -125,6 +125,11 @@ enum latency_kind {
 struct metrics {
     uint64_t ranges_registered;
     uint64_t pages_tracked;
+    uint64_t pages_tracked_peak;
+    uint64_t range_add_msgs;
+    uint64_t range_del_msgs;
+    uint64_t range_add_failures;
+    uint64_t range_del_failures;
     uint64_t damon_setup_ok;
     uint64_t damon_setup_fail;
     uint64_t damon_snapshots_total;
@@ -217,6 +222,7 @@ struct session {
     uint64_t lat_seen[LAT_KIND_COUNT];
     int evict_wp_only_mode;
     int logged_process_madvise_errno;
+    int damon_reconfigure_needed;
 };
 
 static volatile sig_atomic_t g_stop = 0;
@@ -493,46 +499,56 @@ static int map_init(struct session *s, size_t want_entries)
     return 0;
 }
 
-static int map_put(struct session *s, uintptr_t key, uint32_t idx)
+static int map_put_raw(struct map_slot *map, size_t map_cap, uintptr_t key, uint32_t idx)
 {
     size_t mask;
     size_t pos;
 
-    if (s->map == NULL || s->map_cap == 0) {
+    if (map == NULL || map_cap == 0) {
         errno = EINVAL;
         return -1;
     }
-    mask = s->map_cap - 1;
+    mask = map_cap - 1;
     pos = (size_t)(hash_addr(key) & mask);
-    while (s->map[pos].idx_plus1 != 0) {
-        if (s->map[pos].key == key) {
-            s->map[pos].idx_plus1 = idx + 1;
+    while (map[pos].idx_plus1 != 0) {
+        if (map[pos].key == key) {
+            map[pos].idx_plus1 = idx + 1;
             return 0;
         }
         pos = (pos + 1) & mask;
     }
-    s->map[pos].key = key;
-    s->map[pos].idx_plus1 = idx + 1;
+    map[pos].key = key;
+    map[pos].idx_plus1 = idx + 1;
     return 0;
 }
 
-static struct page_entry *map_get_page(struct session *s, uintptr_t key)
+static int map_put(struct session *s, uintptr_t key, uint32_t idx)
+{
+    return map_put_raw(s->map, s->map_cap, key, idx);
+}
+
+static struct page_entry *map_get_page_raw(struct map_slot *map, size_t map_cap, struct page_entry *pages, uintptr_t key)
 {
     size_t mask;
     size_t pos;
 
-    if (s->map == NULL || s->map_cap == 0) {
+    if (map == NULL || map_cap == 0) {
         return NULL;
     }
-    mask = s->map_cap - 1;
+    mask = map_cap - 1;
     pos = (size_t)(hash_addr(key) & mask);
-    while (s->map[pos].idx_plus1 != 0) {
-        if (s->map[pos].key == key) {
-            return &s->pages[s->map[pos].idx_plus1 - 1];
+    while (map[pos].idx_plus1 != 0) {
+        if (map[pos].key == key) {
+            return &pages[map[pos].idx_plus1 - 1];
         }
         pos = (pos + 1) & mask;
     }
     return NULL;
+}
+
+static struct page_entry *map_get_page(struct session *s, uintptr_t key)
+{
+    return map_get_page_raw(s->map, s->map_cap, s->pages, key);
 }
 
 static int ensure_ranges_cap(struct session *s, size_t need)
@@ -582,6 +598,73 @@ static int add_range(struct session *s, const struct predicomp_msg_range *msg)
     return 0;
 }
 
+static int add_range_add_locked(struct session *s, const struct predicomp_msg_range_add *msg)
+{
+    struct predicomp_msg_range tmp;
+
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.range_id = msg->range_id;
+    tmp.flags = msg->flags;
+    tmp.start = msg->start;
+    tmp.len = msg->len;
+    return add_range(s, &tmp);
+}
+
+static void recompute_region_bounds_locked(struct session *s)
+{
+    size_t i;
+
+    s->region_min = 0;
+    s->region_max = 0;
+    for (i = 0; i < s->nr_ranges; i++) {
+        uint64_t end = s->ranges[i].start + s->ranges[i].len;
+        if (s->region_min == 0 || s->ranges[i].start < s->region_min) {
+            s->region_min = s->ranges[i].start;
+        }
+        if (end > s->region_max) {
+            s->region_max = end;
+        }
+    }
+}
+
+static ssize_t find_range_index_locked(const struct session *s, uint32_t range_id)
+{
+    size_t i;
+
+    for (i = 0; i < s->nr_ranges; i++) {
+        if (s->ranges[i].id == range_id) {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+static int remove_range_locked(struct session *s, const struct predicomp_msg_range_del *msg)
+{
+    ssize_t idx;
+    struct range_desc *r;
+
+    idx = find_range_index_locked(s, msg->range_id);
+    if (idx < 0) {
+        errno = ENOENT;
+        return -1;
+    }
+    r = &s->ranges[idx];
+    if (r->start != msg->start || r->len != msg->len) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((size_t)idx + 1 < s->nr_ranges) {
+        memmove(&s->ranges[idx],
+                &s->ranges[idx + 1],
+                (s->nr_ranges - ((size_t)idx + 1)) * sizeof(s->ranges[0]));
+    }
+    s->nr_ranges--;
+    s->m.ranges_registered = s->nr_ranges;
+    recompute_region_bounds_locked(s);
+    return 0;
+}
+
 static int build_page_table(struct session *s)
 {
     size_t i;
@@ -592,11 +675,21 @@ static int build_page_table(struct session *s)
     for (i = 0; i < s->nr_ranges; i++) {
         total_pages += (size_t)(s->ranges[i].len / PAGE_SZ);
     }
+    if (total_pages == 0) {
+        s->pages = NULL;
+        s->map = NULL;
+        s->map_cap = 0;
+        s->nr_pages = 0;
+        s->m.pages_tracked = 0;
+        return 0;
+    }
     s->pages = calloc(total_pages, sizeof(*s->pages));
     if (s->pages == NULL) {
         return -1;
     }
     if (map_init(s, total_pages) != 0) {
+        free(s->pages);
+        s->pages = NULL;
         return -1;
     }
 
@@ -621,6 +714,118 @@ static int build_page_table(struct session *s)
     }
     s->nr_pages = total_pages;
     s->m.pages_tracked = total_pages;
+    if (s->m.pages_tracked > s->m.pages_tracked_peak) {
+        s->m.pages_tracked_peak = s->m.pages_tracked;
+    }
+    return 0;
+}
+
+static void free_page_table_locked(struct session *s)
+{
+    size_t i;
+
+    for (i = 0; i < s->nr_pages; i++) {
+        free(s->pages[i].blob);
+        s->pages[i].blob = NULL;
+    }
+    free(s->pages);
+    s->pages = NULL;
+    s->nr_pages = 0;
+    free(s->map);
+    s->map = NULL;
+    s->map_cap = 0;
+    s->m.pages_tracked = 0;
+}
+
+static int rebuild_page_table_preserve_locked(struct session *s)
+{
+    struct page_entry *old_pages;
+    struct map_slot *old_map;
+    size_t old_nr_pages;
+    size_t old_map_cap;
+    struct page_entry *new_pages;
+    struct map_slot *new_map;
+    size_t total_pages;
+    size_t i;
+    size_t idx;
+
+    old_pages = s->pages;
+    old_map = s->map;
+    old_nr_pages = s->nr_pages;
+    old_map_cap = s->map_cap;
+
+    total_pages = 0;
+    for (i = 0; i < s->nr_ranges; i++) {
+        total_pages += (size_t)(s->ranges[i].len / PAGE_SZ);
+    }
+    new_pages = NULL;
+    new_map = NULL;
+    if (total_pages > 0) {
+        size_t cap = 1;
+        while (cap < total_pages * 2 + 1) {
+            cap <<= 1;
+        }
+        new_pages = calloc(total_pages, sizeof(*new_pages));
+        new_map = calloc(cap, sizeof(*new_map));
+        if (new_pages == NULL || new_map == NULL) {
+            free(new_pages);
+            free(new_map);
+            errno = ENOMEM;
+            return -1;
+        }
+        s->map_cap = cap;
+    } else {
+        s->map_cap = 0;
+    }
+
+    idx = 0;
+    for (i = 0; i < s->nr_ranges; i++) {
+        uint64_t off;
+        for (off = 0; off < s->ranges[i].len; off += PAGE_SZ) {
+            uintptr_t addr;
+            struct page_entry *dst;
+            struct page_entry *oldp;
+
+            addr = (uintptr_t)(s->ranges[i].start + off);
+            dst = &new_pages[idx];
+            memset(dst, 0, sizeof(*dst));
+            oldp = map_get_page_raw(old_map, old_map_cap, old_pages, addr);
+            if (oldp != NULL) {
+                *dst = *oldp;
+                oldp->blob = NULL;
+                dst->range_id = s->ranges[i].id;
+            } else {
+                dst->addr = addr;
+                dst->range_id = s->ranges[i].id;
+                dst->state = PAGE_STATE_PRESENT;
+                dst->last_damon_seen_ns = now_ns();
+            }
+            if (map_put_raw(new_map, s->map_cap, dst->addr, (uint32_t)idx) != 0) {
+                size_t j;
+                for (j = 0; j <= idx; j++) {
+                    free(new_pages[j].blob);
+                }
+                free(new_pages);
+                free(new_map);
+                return -1;
+            }
+            idx++;
+        }
+    }
+
+    for (i = 0; i < old_nr_pages; i++) {
+        free(old_pages[i].blob);
+    }
+    free(old_pages);
+    free(old_map);
+
+    s->pages = new_pages;
+    s->map = new_map;
+    s->nr_pages = total_pages;
+    s->m.pages_tracked = total_pages;
+    if (s->m.pages_tracked > s->m.pages_tracked_peak) {
+        s->m.pages_tracked_peak = s->m.pages_tracked;
+    }
     return 0;
 }
 
@@ -1350,6 +1555,23 @@ static void *bg_thread_main(void *arg)
 
         tnow = now_ns();
         memset(&snap, 0, sizeof(snap));
+        pthread_mutex_lock(&s->mu);
+        if (s->damon_reconfigure_needed) {
+            if (s->damon.enabled) {
+                pager_damon_stop(&s->damon);
+                memset(&s->damon, 0, sizeof(s->damon));
+            }
+            if (s->nr_ranges > 0 && s->region_max > s->region_min) {
+                if (pager_damon_setup(&s->damon, s->pid, s->region_min, s->region_max, &s->damon_cfg) == 0) {
+                    s->m.damon_setup_ok++;
+                } else {
+                    s->m.damon_setup_fail++;
+                    memset(&s->damon, 0, sizeof(s->damon));
+                }
+            }
+            s->damon_reconfigure_needed = 0;
+        }
+        pthread_mutex_unlock(&s->mu);
         if (s->damon.enabled) {
             rc = pager_damon_poll_snapshot(&s->damon, &s->damon_cfg, tnow, &snap);
             if (rc == 0) {
@@ -1434,7 +1656,9 @@ static void dump_metrics(const struct session *s)
     fault_all = &s->lat_stats[LAT_FAULT_ALL];
     restore_wall = &s->lat_stats[LAT_RESTORE_WALL];
     fprintf(stderr,
-            "predicomp_pager: session pid=%d ranges=%" PRIu64 " pages=%" PRIu64 " damon_ok=%" PRIu64
+            "predicomp_pager: session pid=%d ranges=%" PRIu64 " pages=%" PRIu64 " pages_peak=%" PRIu64
+            " range_add=%" PRIu64 " range_del=%" PRIu64
+            " damon_ok=%" PRIu64
             " damon_fail=%" PRIu64 " snapshots=%" PRIu64 " damon_regions=%" PRIu64
             " damon_read_err=%" PRIu64 " cold_marked=%" PRIu64 " wp_armed=%" PRIu64
             " compress_attempts=%" PRIu64 " compress_success=%" PRIu64 " compress_skip=%" PRIu64
@@ -1455,6 +1679,9 @@ static void dump_metrics(const struct session *s)
             s->pid,
             m->ranges_registered,
             m->pages_tracked,
+            m->pages_tracked_peak,
+            m->range_add_msgs,
+            m->range_del_msgs,
             m->damon_setup_ok,
             m->damon_setup_fail,
             m->damon_snapshots_total,
@@ -1549,15 +1776,7 @@ static void stop_session(struct session *s)
         close(s->rpc_fd);
         s->rpc_fd = -1;
     }
-    for (i = 0; i < s->nr_pages; i++) {
-        free(s->pages[i].blob);
-    }
-    free(s->pages);
-    s->pages = NULL;
-    s->nr_pages = 0;
-    free(s->map);
-    s->map = NULL;
-    s->map_cap = 0;
+    free_page_table_locked(s);
     free(s->ranges);
     s->ranges = NULL;
     s->nr_ranges = 0;
@@ -1570,6 +1789,7 @@ static void stop_session(struct session *s)
     memset(&s->m, 0, sizeof(s->m));
     s->region_min = 0;
     s->region_max = 0;
+    s->damon_reconfigure_needed = 0;
     s->active = 0;
 }
 
@@ -1610,15 +1830,17 @@ static int start_runtime(struct session *s)
     s->damon_cfg.nr_regions_min = s->cfg.damon_nr_regions_min;
     s->damon_cfg.nr_regions_max = s->cfg.damon_nr_regions_max;
 
-    if (pager_damon_setup(&s->damon, s->pid, s->region_min, s->region_max, &s->damon_cfg) == 0) {
-        s->m.damon_setup_ok++;
-    } else {
-        s->m.damon_setup_fail++;
-        log_msg(s,
-                "predicomp_pager: DAMON setup failed (continuing without DAMON) errno=%d (%s)\n",
-                errno,
-                strerror(errno));
-        memset(&s->damon, 0, sizeof(s->damon));
+    if (s->nr_ranges > 0 && s->region_max > s->region_min) {
+        if (pager_damon_setup(&s->damon, s->pid, s->region_min, s->region_max, &s->damon_cfg) == 0) {
+            s->m.damon_setup_ok++;
+        } else {
+            s->m.damon_setup_fail++;
+            log_msg(s,
+                    "predicomp_pager: DAMON setup failed (continuing without DAMON) errno=%d (%s)\n",
+                    errno,
+                    strerror(errno));
+            memset(&s->damon, 0, sizeof(s->damon));
+        }
     }
 
     s->stop = 0;
@@ -1657,7 +1879,7 @@ static int handle_client(int client_fd, const struct cfg *daemon_cfg)
         return -1;
     }
     if (hello.hdr.type != PREDICOMP_MSG_HELLO || hello.hdr.size != sizeof(hello) ||
-        hello.version != PREDICOMP_PAGER_PROTO_VERSION || hello.nr_ranges == 0) {
+        hello.version != PREDICOMP_PAGER_PROTO_VERSION) {
         (void)send_error_msg(client_fd, PREDICOMP_MSG_HELLO, EPROTO, "invalid hello");
         destroy_session_struct(&s);
         errno = EPROTO;
@@ -1757,6 +1979,74 @@ static int handle_client(int client_fd, const struct cfg *daemon_cfg)
             }
             break;
         }
+        if (hdr.type == PREDICOMP_MSG_RANGE_ADD && hdr.size == sizeof(struct predicomp_msg_range_add)) {
+            struct predicomp_msg_range_add rm;
+            int ok = 0;
+            int saved_errno = 0;
+
+            memcpy(&rm, &hdr, sizeof(hdr));
+            if (recv_full(client_fd, ((unsigned char *)&rm) + sizeof(hdr), sizeof(rm) - sizeof(hdr)) != 0) {
+                break;
+            }
+            pthread_mutex_lock(&s.mu);
+            s.m.range_add_msgs++;
+            if (add_range_add_locked(&s, &rm) != 0) {
+                s.m.range_add_failures++;
+                saved_errno = errno;
+            } else if (rebuild_page_table_preserve_locked(&s) != 0) {
+                s.m.range_add_failures++;
+                saved_errno = errno;
+            } else {
+                s.damon_reconfigure_needed = 1;
+                ok = 1;
+            }
+            pthread_mutex_unlock(&s.mu);
+            if (!ok) {
+                (void)send_error_msg(client_fd,
+                                     PREDICOMP_MSG_RANGE_ADD,
+                                     saved_errno ? saved_errno : EINVAL,
+                                     "range add failed");
+                continue;
+            }
+            if (send_ack(client_fd, PREDICOMP_MSG_RANGE_ADD) != 0) {
+                break;
+            }
+            continue;
+        }
+        if (hdr.type == PREDICOMP_MSG_RANGE_DEL && hdr.size == sizeof(struct predicomp_msg_range_del)) {
+            struct predicomp_msg_range_del rm;
+            int ok = 0;
+            int saved_errno = 0;
+
+            memcpy(&rm, &hdr, sizeof(hdr));
+            if (recv_full(client_fd, ((unsigned char *)&rm) + sizeof(hdr), sizeof(rm) - sizeof(hdr)) != 0) {
+                break;
+            }
+            pthread_mutex_lock(&s.mu);
+            s.m.range_del_msgs++;
+            if (remove_range_locked(&s, &rm) != 0) {
+                s.m.range_del_failures++;
+                saved_errno = errno;
+            } else if (rebuild_page_table_preserve_locked(&s) != 0) {
+                s.m.range_del_failures++;
+                saved_errno = errno;
+            } else {
+                s.damon_reconfigure_needed = 1;
+                ok = 1;
+            }
+            pthread_mutex_unlock(&s.mu);
+            if (!ok) {
+                (void)send_error_msg(client_fd,
+                                     PREDICOMP_MSG_RANGE_DEL,
+                                     saved_errno ? saved_errno : EINVAL,
+                                     "range del failed");
+                continue;
+            }
+            if (send_ack(client_fd, PREDICOMP_MSG_RANGE_DEL) != 0) {
+                break;
+            }
+            continue;
+        }
 
         {
             size_t rem;
@@ -1833,7 +2123,7 @@ static double pct_of(uint64_t part, uint64_t whole)
 static void csv_write_header(FILE *fp)
 {
     fprintf(fp,
-            "session_pid,ranges_registered,pages_tracked,"
+            "session_pid,ranges_registered,pages_tracked,pages_tracked_peak,range_add_msgs,range_del_msgs,range_add_failures,range_del_failures,"
             "session_start_ns,session_end_ns,session_wall_ns,"
             "cold_age_ms,damon_read_tick_ms,soft_cap_bytes,latency_sample_step,latency_max_samples,"
             "damon_setup_ok,damon_setup_fail,damon_snapshots_total,damon_regions_total,damon_read_errors,pages_cold_marked,"
@@ -1889,7 +2179,7 @@ static void csv_write_session_row(FILE *fp, const struct session *s)
     evict_mode_wp_only = (m->compress_wp_only_fallback > 0) ? 1 : 0;
 
     fprintf(fp,
-            "%d,%" PRIu64 ",%" PRIu64 ","
+            "%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
             "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
             "%u,%u,%" PRIu64 ",%u,%u,"
             "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
@@ -1910,6 +2200,11 @@ static void csv_write_session_row(FILE *fp, const struct session *s)
             s->pid,
             m->ranges_registered,
             m->pages_tracked,
+            m->pages_tracked_peak,
+            m->range_add_msgs,
+            m->range_del_msgs,
+            m->range_add_failures,
+            m->range_del_failures,
             m->session_start_ns,
             m->session_end_ns,
             m->session_wall_ns,
