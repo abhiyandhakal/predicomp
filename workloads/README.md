@@ -215,6 +215,35 @@ Example (`mmap_churn`, actual churned mappings):
 Because mappings are short-lived, compression can legitimately stay near zero
 while fault counts are high (UFFD missing faults on newly registered pages).
 
+## Baseline vs Pager A/B comparison runner
+
+Use the A/B harness to run each supported workload twice:
+
+1. baseline (no process-pager)
+2. pager (`--use-process-pager`)
+
+The script captures:
+
+- workload stdout for both runs
+- GNU `time -v` metrics when available (`user/system CPU`, page faults, RSS)
+- pager daemon summary + CSV (pager run only)
+- joined `comparison.csv` and `summary.txt`
+
+Example (run as root inside the VM):
+
+```bash
+./workloads/scripts/run_process_pager_ab.sh --duration-sec 10
+```
+
+Single workload:
+
+```bash
+./workloads/scripts/run_process_pager_ab.sh --duration-sec 10 --only random_touch_heap
+```
+
+If GNU `time` is not installed in the guest, the script still runs and compares
+workload and pager metrics, but `time -v` columns are left as `0`.
+
 `interactive_burst` (internal-only pilot) also supports:
 
 - `--arena-autoloops`
