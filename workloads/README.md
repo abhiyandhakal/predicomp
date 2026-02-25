@@ -244,6 +244,49 @@ Single workload:
 If GNU `time` is not installed in the guest, the script still runs and compares
 workload and pager metrics, but `time -v` columns are left as `0`.
 
+## Repeated A/B benchmarking + graphs
+
+Use the repeat harness to run the A/B runner multiple times, aggregate results,
+and generate plots.
+
+Outputs:
+
+- per-run raw artifacts under `runs/run-XXX/` (verbatim single-run A/B outputs)
+- `all_runs_long.csv` (one row per workload per repeat)
+- `aggregate.csv` (summary stats per workload)
+- `aggregate_summary.txt` (readable table)
+- `plots/*.png` and `plots/*.svg` (if plotting succeeds)
+
+Example (all pager-supported workloads, 5 repeats):
+
+```bash
+./workloads/scripts/run_process_pager_ab_repeats.sh --runs 5 --duration-sec 10
+```
+
+Example (single workload smoke):
+
+```bash
+./workloads/scripts/run_process_pager_ab_repeats.sh --runs 2 --duration-sec 3 --only anon_streamer
+```
+
+Notes:
+
+- Run inside the VM as root.
+- Plotting uses `python3` + `matplotlib`. If `matplotlib` is missing, the script
+  still writes aggregate CSV/text outputs and warns.
+- `mmap_churn` is included, but compression can remain low/zero because mappings
+  are short-lived; range add/del and fault metrics are still meaningful.
+
+Primary plots produced:
+
+- `throughput_ratio_by_workload` (`pager / baseline`)
+- `elapsed_ratio_by_workload` (`pager / baseline`)
+- `pager_daemon_cpu_breakdown`
+- `fault_missing_latency_p95_p99` (log-scale)
+- `restore_latency_p95_p99` (log-scale)
+- `pager_activity_counts`
+- `mmap_churn_range_ops_vs_faults`
+
 `interactive_burst` (internal-only pilot) also supports:
 
 - `--arena-autoloops`
