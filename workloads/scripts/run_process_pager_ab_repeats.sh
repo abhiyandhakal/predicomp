@@ -112,6 +112,7 @@ all_long_csv="$results_dir/all_runs_long.csv"
 agg_csv="$results_dir/aggregate.csv"
 agg_summary="$results_dir/aggregate_summary.txt"
 plots_dir="$results_dir/plots"
+host_name="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
 run_inputs=()
 for ((i = 1; i <= runs; i++)); do
@@ -148,7 +149,7 @@ fi
 {
     echo "{"
     echo "  \"generated_utc\": $(json_escape "$(date -u +%FT%TZ)"),"
-    echo "  \"hostname\": $(json_escape "$(hostname)"),"
+    echo "  \"hostname\": $(json_escape "$host_name"),"
     echo "  \"uname\": $(json_escape "$(uname -srvmo 2>/dev/null || uname -a)"),"
     echo "  \"runs\": $runs,"
     echo "  \"duration_sec\": $duration_sec,"
